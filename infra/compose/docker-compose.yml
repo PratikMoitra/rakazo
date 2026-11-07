@@ -322,7 +322,8 @@ services:
       context: ../..
       dockerfile: infra/sandboxes/supervisor/Dockerfile
     environment:
-      MAX_UPLOAD_SIZE_MB: ${MAX_UPLOAD_SIZE_MB:-10}
+      # Phase-1 workspace slice: unset value is 25 MiB (26214400 bytes). Historical fallback was 10.
+      MAX_UPLOAD_SIZE_MB: ${MAX_UPLOAD_SIZE_MB:-25}
       DATA_DIR: /data
       SUPERVISOR_HOST: "0.0.0.0"
       SUPERVISOR_PORT: "7091"

@@ -1,3 +1,4 @@
+// Modified in the isolated phase-1 workspace slice (Apache-2.0; see LICENSE). Not an upstream Rakazo release.
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -147,9 +148,10 @@ describeAttachments("chat attachments", () => {
       botId: bot.id,
       name: "big.zip",
       mimeType: "application/zip",
-      contentBase64: Buffer.alloc(10 * 1024 * 1024 + 1, 1).toString("base64"),
+      contentBase64: Buffer.alloc(26_214_400 + 1, 1).toString("base64"),
     });
     expect(oversize.status).toBeGreaterThanOrEqual(400);
+    expect(await oversize.text()).toContain("upload_too_large");
   });
 
   it("attaches a workspace file into the thread", async () => {

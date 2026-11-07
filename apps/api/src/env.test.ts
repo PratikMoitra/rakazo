@@ -1,3 +1,4 @@
+// Modified in the isolated phase-1 workspace slice (Apache-2.0; see LICENSE). Not an upstream Rakazo release.
 import { describe, expect, it } from "vitest";
 import { loadEnv } from "./env.js";
 
@@ -37,12 +38,13 @@ describe("loadEnv", () => {
     }
   });
 
-  it("defaults uploads to 10 MiB and parses a configured limit", () => {
-    expect(loadEnv(base).maxUploadSizeBytes).toBe(10 * 1024 * 1024);
-    expect(loadEnv({ ...base, MAX_UPLOAD_SIZE_MB: "" }).maxUploadSizeBytes).toBe(10 * 1024 * 1024);
-    expect(loadEnv({ ...base, MAX_UPLOAD_SIZE_MB: " 25 " }).maxUploadSizeBytes).toBe(
-      25 * 1024 * 1024,
+  it("defaults uploads to 25 MiB and parses a configured limit", () => {
+    expect(loadEnv(base).maxUploadSizeBytes).toBe(26_214_400);
+    expect(loadEnv({ ...base, MAX_UPLOAD_SIZE_MB: "" }).maxUploadSizeBytes).toBe(26_214_400);
+    expect(loadEnv({ ...base, MAX_UPLOAD_SIZE_MB: " 10 " }).maxUploadSizeBytes).toBe(
+      10 * 1024 * 1024,
     );
+    expect(loadEnv({ ...base, MAX_UPLOAD_SIZE_MB: " 25 " }).maxUploadSizeBytes).toBe(26_214_400);
   });
 
   it.each(["0", "1e3", "9007199254740991"])("rejects invalid upload limit %s", (value) => {

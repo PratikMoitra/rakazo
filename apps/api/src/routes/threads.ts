@@ -1,3 +1,4 @@
+// Modified in the isolated phase-1 workspace slice (Apache-2.0; see LICENSE). Not an upstream Rakazo release.
 import { ORPCError } from "@orpc/server";
 import { runContinueJob, runJobKey } from "@rakazo/adapter-kit";
 import { settleCallRequest } from "@rakazo/adapters";
@@ -22,6 +23,7 @@ import {
   touchGroupUpdatedAt,
 } from "@rakazo/db";
 import { getLogger } from "@rakazo/logging";
+import { orpcAttachmentError } from "../attachment-error.js";
 import type { RouterDeps } from "../router.js";
 import { createRoutineTestRun, routineTestRunNonce, routineTestTarget } from "../routines.js";
 import { withSerializableRetry } from "../serializable-retry.js";
@@ -147,9 +149,7 @@ export function threadsRoutes(ctx: RouterContext) {
       takeoverReleaser(deps, actor, target),
       startRoutines,
     ).catch((error: unknown) => {
-      if (error instanceof AttachmentValidationError) {
-        throw new ORPCError("BAD_REQUEST", { message: error.message });
-      }
+      if (error instanceof AttachmentValidationError) throw orpcAttachmentError(error);
       throw error;
     });
   };

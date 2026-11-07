@@ -1,4 +1,9 @@
-import { ATTACHMENT_MAX_BYTES, attachmentSizeLabel } from "@rakazo/contracts";
+// Modified in the isolated phase-1 workspace slice (Apache-2.0; see LICENSE). Not an upstream Rakazo release.
+import {
+  attachmentSizeLabel,
+  DEFAULT_UPLOAD_MAX_BYTES,
+  UPLOAD_TOO_LARGE_CODE,
+} from "@rakazo/contracts";
 import type { Context, Hono, MiddlewareHandler } from "hono";
 import { cancelBody } from "./http-body.js";
 
@@ -6,18 +11,30 @@ export const MAX_AUTH_REQUEST_BYTES = 64 * 1024;
 export const MAX_RPC_REQUEST_BYTES = 16 * 1024 * 1024;
 
 /** Bound JSON entry points before their framework parsers buffer the request. */
-export function requestBodyLimit(maxSize: number, tooLargeMessage?: string): MiddlewareHandler {
+export function requestBodyLimit(
+  maxSize: number,
+  tooLargeMessage?: string,
+  code?: string,
+): MiddlewareHandler {
   if (!Number.isSafeInteger(maxSize) || maxSize <= 0) {
     throw new Error("Request body limit must be a positive integer");
   }
-  return async (c, next) => (await limitRequestBody(c, maxSize, tooLargeMessage)) ?? next();
+  return async (c, next) => (await limitRequestBody(c, maxSize, tooLargeMessage, code)) ?? next();
 }
 
-/** The 413 response for a body over maxSize; otherwise the body stays readable downstream. */
+function tooLargeResponse(c: Context, message: string, code?: string): Response {
+  return c.json(code ? { error: message, code } : { error: message }, 413);
+}
+
+/**
+ * The 413 response for a body over maxSize; otherwise the body stays readable downstream.
+ * A declared Content-Length under the cap is not trusted: the bytes are counted.
+ */
 async function limitRequestBody(
   c: Context,
   maxSize: number,
   tooLargeMessage = "Request body is too large.",
+  code?: string,
 ): Promise<Response | undefined> {
   const request = c.req.raw;
   if (!request.body) return undefined;
@@ -27,9 +44,8 @@ async function limitRequestBody(
     const declared = /^[0-9]+$/.test(contentLength) ? Number(contentLength) : Number.NaN;
     if (!Number.isSafeInteger(declared) || declared < 0 || declared > maxSize) {
       cancelBody(request.body);
-      return c.json({ error: tooLargeMessage }, 413);
+      return tooLargeResponse(c, tooLargeMessage, code);
     }
-    return undefined;
   }
 
   const reader = request.body.getReader();
@@ -42,7 +58,7 @@ async function limitRequestBody(
       size += value.byteLength;
       if (size > maxSize) {
         cancelBody(reader);
-        return c.json({ error: tooLargeMessage }, 413);
+        return tooLargeResponse(c, tooLargeMessage, code);
       }
       chunks.push(value);
     }
@@ -63,7 +79,7 @@ async function limitRequestBody(
 }
 
 /** Allow base64 expansion plus room for the RPC JSON envelope. */
-export function rpcRequestMaxBytes(maxUploadSizeBytes = ATTACHMENT_MAX_BYTES): number {
+export function rpcRequestMaxBytes(maxUploadSizeBytes = DEFAULT_UPLOAD_MAX_BYTES): number {
   return Math.max(MAX_RPC_REQUEST_BYTES, Math.ceil(maxUploadSizeBytes / 3) * 4 + 1024 * 1024);
 }
 
@@ -76,11 +92,11 @@ export function mountApiRequestBodyLimits(app: Hono): void {
  * Signed out, only the bodiless `health` procedure is callable, so the body
  * is discarded unread and oRPC answers as it would anyway: 401, or health.
  */
-export function rpcBodyLimit(maxUploadSizeBytes = ATTACHMENT_MAX_BYTES) {
+export function rpcBodyLimit(maxUploadSizeBytes = DEFAULT_UPLOAD_MAX_BYTES) {
   const signedInLimit = rpcRequestMaxBytes(maxUploadSizeBytes);
   const message = `Request body is too large. Upload limit: ${attachmentSizeLabel(maxUploadSizeBytes)} per file.`;
   return async (c: Context, signedIn: boolean) => {
-    if (signedIn) return limitRequestBody(c, signedInLimit, message);
+    if (signedIn) return limitRequestBody(c, signedInLimit, message, UPLOAD_TOO_LARGE_CODE);
     const request = c.req.raw;
     if (request.body) {
       cancelBody(request.body);

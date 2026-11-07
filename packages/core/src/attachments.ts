@@ -1,18 +1,33 @@
+// Modified in the isolated phase-1 workspace slice (Apache-2.0; see LICENSE). Not an upstream Rakazo release.
 import type { AttachmentMimeType, MessageBlock } from "@rakazo/contracts";
 import {
   ATTACHMENT_COUNT_CEILING,
   ATTACHMENT_MAX_BYTES,
   ATTACHMENT_MAX_COUNT,
   attachmentSizeLabel,
+  DEFAULT_UPLOAD_MAX_BYTES,
   isAllowedAttachmentMimeType,
   isAttachmentImageMimeType,
+  UPLOAD_TOO_LARGE_CODE,
 } from "@rakazo/contracts";
 import { isApprovalAskBlock, isSecretAskBlock } from "./action-approval.js";
 
 export class AttachmentValidationError extends Error {
-  constructor(message: string) {
+  readonly code: string;
+  constructor(message: string, code = "attachment_invalid") {
     super(message);
     this.name = "AttachmentValidationError";
+    this.code = code;
+  }
+}
+
+/** Rejects a measured byte length. Callers must pass bytes they counted, not a declared header. */
+export function assertUploadByteLength(actual: number, maxBytes: number): void {
+  if (!Number.isSafeInteger(actual) || actual < 0 || actual > maxBytes) {
+    throw new AttachmentValidationError(
+      `Attachment exceeds the ${attachmentSizeLabel(maxBytes)} limit`,
+      UPLOAD_TOO_LARGE_CODE,
+    );
   }
 }
 
@@ -49,7 +64,7 @@ export function attachmentCountFromEnv(source: { MAX_ATTACHMENTS_PER_MESSAGE?: s
 
 export function uploadSizeFromEnv(source: { MAX_UPLOAD_SIZE_MB?: string }): number {
   const value = source.MAX_UPLOAD_SIZE_MB?.trim();
-  if (!value) return ATTACHMENT_MAX_BYTES;
+  if (!value) return DEFAULT_UPLOAD_MAX_BYTES;
   const mb = Number(value);
   // Leave room for base64 expansion and the JSON envelope in the HTTP body guard.
   if (
@@ -74,6 +89,7 @@ export function decodeAttachmentBase64(
   if (normalized.length > Math.ceil(maxBytes / 3) * 4) {
     throw new AttachmentValidationError(
       `Attachment exceeds the ${attachmentSizeLabel(maxBytes)} limit`,
+      UPLOAD_TOO_LARGE_CODE,
     );
   }
   if (normalized.length % 4 !== 0 || !isWellFormedBase64(normalized)) {
@@ -87,9 +103,7 @@ export function decodeAttachmentBase64(
   }
   if (bytes.byteLength === 0) throw new AttachmentValidationError("Attachment content is empty");
   if (bytes.byteLength > maxBytes) {
-    throw new AttachmentValidationError(
-      `Attachment exceeds the ${attachmentSizeLabel(maxBytes)} limit`,
-    );
+    assertUploadByteLength(bytes.byteLength, maxBytes);
   }
   return new Uint8Array(bytes);
 }

@@ -1,3 +1,4 @@
+// Modified in the isolated phase-1 workspace slice (Apache-2.0; see LICENSE). Not an upstream Rakazo release.
 import { createHash } from "node:crypto";
 import path from "node:path";
 import type {
@@ -15,8 +16,10 @@ import {
   attachmentSizeLabel,
   HISTORY_ATTACHMENTS_PER_RESPONSE,
   MCP_APP_MIME_TYPE,
+  UPLOAD_TOO_LARGE_CODE,
 } from "@rakazo/contracts";
 import {
+  AttachmentValidationError,
   attachmentComputerPath,
   inferAttachmentMimeType,
   messageBlockForArtifact,
@@ -63,8 +66,9 @@ export async function attachWorkspaceFileToThread(
   const name = (input.name?.trim() || fileName).slice(0, ARTIFACT_NAME_MAX_LENGTH);
   validateAttachmentMimeType(mimeType);
   if (input.bytes.byteLength > (deps.maxUploadSizeBytes ?? ATTACHMENT_MAX_BYTES)) {
-    throw new Error(
+    throw new AttachmentValidationError(
       `file exceeds the ${attachmentSizeLabel(deps.maxUploadSizeBytes ?? ATTACHMENT_MAX_BYTES)} attachment limit`,
+      UPLOAD_TOO_LARGE_CODE,
     );
   }
 
@@ -161,8 +165,9 @@ export async function listCurrentTurnFiles(
     const row = byId.get(block.artifactId);
     if (!row) throw new Error(`Attached file is unavailable: ${block.name}`);
     if (row.size > (deps.maxUploadSizeBytes ?? ATTACHMENT_MAX_BYTES)) {
-      throw new Error(
+      throw new AttachmentValidationError(
         `Attached file exceeds the ${attachmentSizeLabel(deps.maxUploadSizeBytes ?? ATTACHMENT_MAX_BYTES)} limit: ${row.name}`,
+        UPLOAD_TOO_LARGE_CODE,
       );
     }
     return threadFileMetadata(row);
@@ -219,8 +224,9 @@ async function materializeThreadFiles(
     if (!exists) {
       const bytes = await deps.artifacts.get(row.storageKey, input.context);
       if (bytes.byteLength > (deps.maxUploadSizeBytes ?? ATTACHMENT_MAX_BYTES)) {
-        throw new Error(
+        throw new AttachmentValidationError(
           `Attached file exceeds the ${attachmentSizeLabel(deps.maxUploadSizeBytes ?? ATTACHMENT_MAX_BYTES)} limit: ${row.name}`,
+          UPLOAD_TOO_LARGE_CODE,
         );
       }
       input.markWorkspaceDirty?.();

@@ -1,7 +1,11 @@
+// Modified in the isolated phase-1 workspace slice (Apache-2.0; see LICENSE). Not an upstream Rakazo release.
+
+import { DEFAULT_UPLOAD_MAX_BYTES, UPLOAD_TOO_LARGE_CODE } from "@rakazo/contracts";
 import { describe, expect, it } from "vitest";
 import {
   AttachmentValidationError,
   artifactTypeLabel,
+  assertUploadByteLength,
   attachmentExtensionForMimeType,
   attachmentsForBot,
   blocksToAgentHistoryText,
@@ -70,6 +74,24 @@ describe("attachment helpers", () => {
     const larger = Buffer.alloc(11 * limit).toString("base64");
     expect(decodeAttachmentBase64(larger, 12 * limit).byteLength).toBe(11 * limit);
     expect(() => decodeAttachmentBase64(larger)).toThrow("10 MiB limit");
+  });
+  it("accepts 26214399 and 26214400 decoded bytes and rejects 26214401", () => {
+    const limit = DEFAULT_UPLOAD_MAX_BYTES;
+    expect(limit).toBe(26_214_400);
+    for (const size of [limit - 1, limit]) {
+      expect(decodeAttachmentBase64(Buffer.alloc(size).toString("base64"), limit).byteLength).toBe(
+        size,
+      );
+      expect(() => assertUploadByteLength(size, limit)).not.toThrow();
+    }
+    const over = Buffer.alloc(limit + 1).toString("base64");
+    expect(() => decodeAttachmentBase64(over, limit)).toThrow(AttachmentValidationError);
+    expect(() => decodeAttachmentBase64(over, limit)).toThrowError(
+      expect.objectContaining({ code: UPLOAD_TOO_LARGE_CODE }),
+    );
+    expect(() => assertUploadByteLength(limit + 1, limit)).toThrowError(
+      expect.objectContaining({ code: UPLOAD_TOO_LARGE_CODE }),
+    );
   });
   it("accepts zip archives and rejects unsupported mime types and empty payloads", () => {
     expect(() => validateAttachmentMimeType("application/zip")).not.toThrow();

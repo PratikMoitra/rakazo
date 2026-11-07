@@ -1,3 +1,4 @@
+// Modified in the isolated phase-1 workspace slice (Apache-2.0; see LICENSE). Not an upstream Rakazo release.
 import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
@@ -248,7 +249,13 @@ describe("sandbox supervisor HTTP boundary", () => {
     expect(Buffer.byteLength(JSON.stringify(payload))).toBeLessThan(
       supervisorRequestBodyLimit("POST", "/computers/id/files", limit),
     );
-    expect(supervisorFileWriteSchema().safeParse(payload).success).toBe(false);
+    expect(supervisorFileWriteSchema().safeParse(payload).success).toBe(true);
+    expect(
+      supervisorFileWriteSchema().safeParse({
+        path: "large.txt",
+        content: "A".repeat(Math.ceil(26_214_400 / 3) * 4 + 1),
+      }).success,
+    ).toBe(false);
     expect(
       supervisorFileWriteSchema(limit).safeParse({
         path: "large.txt",
