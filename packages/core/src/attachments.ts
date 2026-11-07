@@ -62,9 +62,13 @@ export function attachmentCountFromEnv(source: { MAX_ATTACHMENTS_PER_MESSAGE?: s
   return count;
 }
 
-export function uploadSizeFromEnv(source: { MAX_UPLOAD_SIZE_MB?: string }): number {
+/** Bytes from the environment, and whether the operator set the variable. */
+export function uploadLimitFromEnv(source: { MAX_UPLOAD_SIZE_MB?: string }): {
+  maxUploadSizeBytes: number;
+  explicit: boolean;
+} {
   const value = source.MAX_UPLOAD_SIZE_MB?.trim();
-  if (!value) return DEFAULT_UPLOAD_MAX_BYTES;
+  if (!value) return { maxUploadSizeBytes: DEFAULT_UPLOAD_MAX_BYTES, explicit: false };
   const mb = Number(value);
   // Leave room for base64 expansion and the JSON envelope in the HTTP body guard.
   if (
@@ -77,7 +81,11 @@ export function uploadSizeFromEnv(source: { MAX_UPLOAD_SIZE_MB?: string }): numb
       "MAX_UPLOAD_SIZE_MB must be a positive integer number of MiB within the safe byte range",
     );
   }
-  return mb * 1024 * 1024;
+  return { maxUploadSizeBytes: mb * 1024 * 1024, explicit: true };
+}
+
+export function uploadSizeFromEnv(source: { MAX_UPLOAD_SIZE_MB?: string }): number {
+  return uploadLimitFromEnv(source).maxUploadSizeBytes;
 }
 
 export function decodeAttachmentBase64(

@@ -45,6 +45,28 @@ describe("API request body limits", () => {
     });
   });
 
+  it("rejects an unfinished body before the route parser", async () => {
+    const { app, parse } = testApp(1024);
+    const response = await app.request(
+      new Request("http://localhost/parse", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: new ReadableStream({
+          pull(controller) {
+            controller.error(new Error("client cancelled"));
+          },
+        }),
+        duplex: "half",
+      } as RequestInit & { duplex: "half" }),
+    );
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({
+      error: "Upload was not finished.",
+      code: "upload_incomplete",
+    });
+    expect(parse).not.toHaveBeenCalled();
+  });
+
   it("counts actual bytes when Content-Length understates the body", async () => {
     const cancel = vi.fn();
     const { app, parse } = testApp(8);

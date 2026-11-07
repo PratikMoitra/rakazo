@@ -37,6 +37,22 @@ This is the isolated foundation slice of the approved Rakazo workspace design. I
 - There is no virus scanner and no quarantine directory.
 - HTML preview may run script in a sandbox that does not share the app origin (`packages/core/src/artifact-sandbox.ts`). SVG is not an allowed attachment type.
 
+## Upload policy precedence
+
+An explicit `MAX_UPLOAD_SIZE_MB` is both the effective per-file limit and the process allocation ceiling. Owner and admin changes are rejected while it is set. When it is unset, the ceiling is 26,214,400 bytes. An organization owner or admin may store a whole number of MiB from 1 through that ceiling. The stored value becomes the effective limit. A stored value above the ceiling is ignored. `me.maxUploadSizeBytes` and `me.uploadPolicy` advertise that one effective value. A successful change writes one `upload.policy.changed` audit event. Repeating the same value does not write another. A member is denied and writes none.
+
+The HTTP body buffer stays at the process ceiling until restart. The persisted value cannot raise it.
+
+## File paths and the 12 MiB socket
+
+- Supported at the effective limit, including 25 MiB when that is the ceiling: chat `artifacts/create` over HTTP, and the Docker supervisor `POST /computers/:id/files` HTTP route, whose body allowance follows `MAX_UPLOAD_SIZE_MB`.
+- Unsupported at 25 MiB, and left unchanged: the host-computer channel. Its message cap is 12 MiB (`HOST_COMPUTER_MAX_BYTES`) and its file cap is 8 MiB (`HOST_COMPUTER_MAX_FILE_BYTES`). The user-device websocket uses that message cap plus a small margin. Those caps also bound commands, so this slice does not raise them.
+- There is no separate resumable chunk protocol. An unfinished HTTP body is rejected with `upload_incomplete` and is not stored.
+
+## Schema
+
+`deployment_settings.maxUploadSizeBytes` is a nullable integer added by `20261201120000_upload_policy`. Previous releases do not read it. Leaving the column in place after a code rollback is safe. Dropping it is safe only after this code is no longer running. This change is not applied to a production database by this branch.
+
 ## Mobile compatibility
 
 Source of `apps/mobile` at this commit:
@@ -46,6 +62,8 @@ Source of `apps/mobile` at this commit:
 - Chat send uses `threads/send` and `threads/sendWithRoutines`. Events use `subscribeThread`. Uploads use `artifacts/create` and `attachmentMaxBytes(uploadConfig)`.
 - When the server omits `maxUploadSizeBytes`, this source still falls back to 10 MiB. A server that advertises 26214400 is what a current client will enforce.
 - The installed phone build is unknown. Store listings were not created or changed. No simulator or device was run. A new app with new bundle ids is not required for this slice because the existing client contract still reaches the same procedures.
+
+To test a phone later, use the already installed app. Do not create a store listing. On the sign-in screen choose a custom server and enter the isolated API origin. Sign in, open a bot, and confirm a file at the advertised limit sends while one byte over does not. Record the installed version from the device settings screen. The source tree says version 1.0.12, iOS build number 1, Android version code 10, bundle `com.rakazo.app`. Those numbers are the source, not proof of the installed binary.
 
 ## Out of scope
 

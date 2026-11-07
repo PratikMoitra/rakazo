@@ -1,3 +1,4 @@
+// Modified in the isolated phase-1 workspace slice (Apache-2.0; see LICENSE). Not an upstream Rakazo release.
 export * from "./action-approval.js";
 export * from "./activity-sections.js";
 export * from "./agent-import/index.js";
@@ -110,6 +111,7 @@ export * from "./tool-activity.js";
 export * from "./translate.js";
 export * from "./ui-locale.js";
 export * from "./unread-divider.js";
+export * from "./upload-policy.js";
 export * from "./user-error.js";
 export * from "./voice-chat-groups.js";
 export * from "./voice-response.js";

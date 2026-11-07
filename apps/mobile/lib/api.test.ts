@@ -256,6 +256,40 @@ describe("mobile API authentication", () => {
     expect(resumeLiveNotifications).not.toHaveBeenCalled();
   });
 
+  it("signs in and reads me from a custom server", async () => {
+    try {
+      const saved = await saveApiBase("http://192.168.1.20:3100");
+      expect(saved).toEqual({ ok: true, url: "http://192.168.1.20:3100" });
+      const fetchMock = vi.fn(async (url: string) => {
+        if (String(url).endsWith("/api/auth/sign-in/email")) {
+          return jsonResponse({ token: "session-token" });
+        }
+        return jsonResponse({
+          json: {
+            userId: "user-1",
+            spaceId: "space-1",
+            maxUploadSizeBytes: 26_214_400,
+            maxAttachmentsPerMessage: 4,
+          },
+        });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      await signIn("ada@example.com", "correct horse");
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://192.168.1.20:3100/api/auth/sign-in/email",
+        expect.anything(),
+      );
+      vi.mocked(SecureStore.getItemAsync).mockImplementation(async (key) =>
+        key === "rakazo.session_token" ? "session-token" : null,
+      );
+      const me = await rpc<{ maxUploadSizeBytes: number }>("me");
+      expect(me.maxUploadSizeBytes).toBe(26_214_400);
+      expect(String(fetchMock.mock.calls.at(-1)?.[0])).toBe("http://192.168.1.20:3100/rpc/me");
+    } finally {
+      await resetApiBase();
+    }
+  });
+
   it("deletes unsent messages left on disk when a new account signs in", async () => {
     const clear = vi.fn();
     configureUnsentSends({

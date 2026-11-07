@@ -2,6 +2,7 @@
 import {
   attachmentSizeLabel,
   DEFAULT_UPLOAD_MAX_BYTES,
+  UPLOAD_INCOMPLETE_CODE,
   UPLOAD_TOO_LARGE_CODE,
 } from "@rakazo/contracts";
 import type { Context, Hono, MiddlewareHandler } from "hono";
@@ -62,6 +63,9 @@ async function limitRequestBody(
       }
       chunks.push(value);
     }
+  } catch {
+    cancelBody(reader);
+    return c.json({ error: "Upload was not finished.", code: UPLOAD_INCOMPLETE_CODE }, 400);
   } finally {
     reader.releaseLock();
   }

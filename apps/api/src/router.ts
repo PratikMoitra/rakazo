@@ -1,3 +1,4 @@
+// Modified in the isolated phase-1 workspace slice (Apache-2.0; see LICENSE). Not an upstream Rakazo release.
 import type {
   AgentHomeStore,
   ArtifactStore,
@@ -128,6 +129,8 @@ export interface RouterDeps {
     phoneCallsEnabled?: boolean;
     phoneCallRingSeconds?: number;
     maxUploadSizeBytes?: number;
+    /** True when MAX_UPLOAD_SIZE_MB is set and locks the effective limit. */
+    uploadSizeExplicit?: boolean;
     maxAttachmentsPerMessage?: number;
     agentRuntime: string;
     teamChatJudgeProvider?: string;

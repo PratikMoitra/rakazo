@@ -217,9 +217,18 @@ is no quarantine directory. Accepted files are stored under a generated id with
 owner-only permissions after the byte check. SVG is not an allowed attachment type.
 HTML previews may run script inside a sandbox that does not share the app origin and
 blocks outbound loads; that is not a malware scan.
-Set it in `.env` and restart the API, worker, and Docker supervisor (when used). Web, desktop, and mobile use the
-limit advertised by the server. If a reverse proxy limits request bodies, allow
+Set it in `.env` and restart the API, worker, and Docker supervisor (when used). An explicit
+`MAX_UPLOAD_SIZE_MB` is the effective limit and the allocation ceiling. While it is set, an
+owner or admin cannot store a different limit. When it is unset, an owner or admin may store
+a whole number of MiB from 1 through 25. That stored value is the effective limit, and it
+cannot exceed the process ceiling, so it cannot grow the HTTP buffer. Web, desktop, and mobile
+read `me.maxUploadSizeBytes`, which is that one effective value. `me.uploadPolicy` repeats it
+with `source` of `env`, `persisted`, or `default`. If a reverse proxy limits request bodies, allow
 room for base64 encoding (about 4/3 of the file size) and the JSON envelope.
+
+Chat attachment upload and the Docker supervisor file HTTP route follow this ceiling. The host
+computer channel does not: its message cap stays 12 MiB and its file cap stays 8 MiB. A 25 MiB
+chat file is not transferred through that socket.
 
 `MAX_ATTACHMENTS_PER_MESSAGE` sets the chat attachment count per message. It defaults
 to `4` and accepts integers from `1` to `100`. Set it in `.env` and restart the API.

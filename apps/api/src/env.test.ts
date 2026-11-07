@@ -45,6 +45,8 @@ describe("loadEnv", () => {
       10 * 1024 * 1024,
     );
     expect(loadEnv({ ...base, MAX_UPLOAD_SIZE_MB: " 25 " }).maxUploadSizeBytes).toBe(26_214_400);
+    expect(loadEnv(base).uploadSizeExplicit).toBe(false);
+    expect(loadEnv({ ...base, MAX_UPLOAD_SIZE_MB: "10" }).uploadSizeExplicit).toBe(true);
   });
 
   it.each(["0", "1e3", "9007199254740991"])("rejects invalid upload limit %s", (value) => {

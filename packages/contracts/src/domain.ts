@@ -1,3 +1,4 @@
+// Modified in the isolated phase-1 workspace slice (Apache-2.0; see LICENSE). Not an upstream Rakazo release.
 import * as z from "zod";
 import { AGENT_SECRET_NAME_PATTERN } from "./agent-secret-name.js";
 import { BotAvatarSetSchema, BotAvatarValueSchema } from "./bot-avatar.js";
@@ -2019,9 +2020,19 @@ export const ServerUpdateRequestSchema = z.object({
 });
 export type ServerUpdateRequest = z.infer<typeof ServerUpdateRequestSchema>;
 
+export const UploadPolicySchema = z.object({
+  maxFileBytes: z.number().int().positive(),
+  ceilingBytes: z.number().int().positive(),
+  source: z.enum(["env", "persisted", "default"]),
+  envLocked: z.boolean(),
+});
+export type UploadPolicy = z.infer<typeof UploadPolicySchema>;
+
 export const MeSchema = z.object({
   maxUploadSizeBytes: z.number().int().positive().optional(),
   maxAttachmentsPerMessage: z.number().int().positive().optional(),
+  /** The one effective upload policy. Absent from older servers. */
+  uploadPolicy: UploadPolicySchema.optional(),
   ticketBoardEnabled: z.boolean(),
   phoneCallsEnabled: z.boolean().default(false),
   /** Operator-configured menu links. Absent from older servers. */

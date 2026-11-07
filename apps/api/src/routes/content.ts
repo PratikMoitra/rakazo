@@ -3,7 +3,7 @@ import { ORPCError } from "@orpc/server";
 import type { UsageOperationKind } from "@rakazo/adapter-kit";
 import { resolveBotWorkspacePath } from "@rakazo/adapters";
 import type { ExportManifest } from "@rakazo/contracts";
-import { attachmentMaxBytes, resolveBotAvatarSet } from "@rakazo/contracts";
+import { resolveBotAvatarSet } from "@rakazo/contracts";
 import { AttachmentValidationError } from "@rakazo/core";
 import { IsolationError, LISTED_ARTIFACT, parseComputerMode } from "@rakazo/db";
 import {
@@ -21,6 +21,7 @@ import { requireIdentityConfirmation } from "../identity-confirmation.js";
 import { listSpaceRuns } from "../runs.js";
 import { querySpaceSearch } from "../search.js";
 import { loadAllMessages } from "../thread-message-pages.js";
+import { currentUploadPolicy } from "../upload-policy.js";
 import type { RouterContext } from "./context.js";
 
 const EXPORT_MESSAGE_PAGE_SIZE = 500;
@@ -73,7 +74,7 @@ export function contentRoutes(ctx: RouterContext) {
         if (!botId) throw new IsolationError();
         try {
           return await createOwnedArtifact(
-            { ...deps, maxUploadSizeBytes: attachmentMaxBytes(deps.env) },
+            { ...deps, maxUploadSizeBytes: (await currentUploadPolicy(deps)).maxFileBytes },
             context.actor,
             { ...input, botId },
           );

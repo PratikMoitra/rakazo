@@ -19,7 +19,7 @@ The root package and the app and library packages that declare a license field u
 
 ## Dependency inventory
 
-Third-party licenses are collected from installed `package.json` files after `pnpm install --frozen-lockfile` on this commit's lockfile (`lockfileVersion` 9.0). `docs/compliance/dependency-license-summary.json` lists each installed name, version, and license field, plus counts. 2187 package versions were read. Most declare MIT, Apache-2.0, ISC, or BSD. A populated field is attribution data, not a legal opinion, and it does not permit resale.
+Third-party licenses were read from installed `package.json` files after `pnpm install --frozen-lockfile` on this commit's lockfile (`lockfileVersion` 9.0). 2187 package versions were counted. The committed summary keeps the counts and the non-permissive or missing entries. The full name list is not committed, because it was generated bulk rather than source. A populated field is attribution data, not a legal opinion, and it does not permit resale.
 
 Items a reviewer should read before any distribution, because the declared license is copyleft, functional-source, missing, or unusual:
 

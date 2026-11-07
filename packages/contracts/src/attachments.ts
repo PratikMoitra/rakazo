@@ -9,6 +9,10 @@ export const ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024;
 export const DEFAULT_UPLOAD_MAX_BYTES = 26_214_400;
 /** Stable machine code when actual bytes exceed the configured per-file limit. */
 export const UPLOAD_TOO_LARGE_CODE = "upload_too_large";
+export const UPLOAD_POLICY_FORBIDDEN_CODE = "upload_policy_forbidden";
+export const UPLOAD_POLICY_LOCKED_CODE = "upload_policy_locked";
+export const UPLOAD_POLICY_INVALID_CODE = "upload_policy_invalid";
+export const UPLOAD_INCOMPLETE_CODE = "upload_incomplete";
 export const ATTACHMENT_MAX_COUNT = 4;
 /** Hard ceiling for the configurable per-message limit. */
 export const ATTACHMENT_COUNT_CEILING = 100;

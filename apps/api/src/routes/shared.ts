@@ -1,3 +1,4 @@
+// Modified in the isolated phase-1 workspace slice (Apache-2.0; see LICENSE). Not an upstream Rakazo release.
 import {
   deploymentModelRole,
   findConnectedModelCredential,
@@ -8,15 +9,11 @@ import {
   selectConfiguredModel,
 } from "@rakazo/adapters";
 import type { Actor, Me } from "@rakazo/contracts";
-import {
-  attachmentMaxBytes,
-  attachmentMaxCount,
-  canonicalPiProviderId,
-  resolveBotAvatarSet,
-} from "@rakazo/contracts";
+import { attachmentMaxCount, canonicalPiProviderId, resolveBotAvatarSet } from "@rakazo/contracts";
 import { isAdmin } from "../admins.js";
 import { effectiveSandboxProvider } from "../computer-provider-config.js";
 import type { RouterDeps } from "../router.js";
+import { uploadPolicyFor } from "../upload-policy.js";
 
 export { createAdapterContext as computerContext } from "@rakazo/adapter-kit";
 
@@ -44,11 +41,13 @@ export async function meDto(deps: RouterDeps, actor: Actor): Promise<Me> {
   ]);
   // Where the deployment runs computers once an admin's choice in Settings applies.
   const sandboxProvider = effectiveSandboxProvider(setup.settings, deps.env.sandboxProvider);
+  const uploadPolicy = uploadPolicyFor(deps.env, setup.settings?.maxUploadSizeBytes);
   return {
     ticketBoardEnabled: deps.env.ticketBoardEnabled === true,
     phoneCallsEnabled: deps.env.phoneCallsEnabled === true,
     navLinks: deps.env.navLinks ?? [],
-    maxUploadSizeBytes: attachmentMaxBytes(deps.env),
+    maxUploadSizeBytes: uploadPolicy.maxFileBytes,
+    uploadPolicy,
     maxAttachmentsPerMessage: attachmentMaxCount(deps.env),
     userId: actor.userId,
     email: user.email,
