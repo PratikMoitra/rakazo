@@ -20,9 +20,13 @@ export class MessagingInstallations implements MessagingInstallationStore {
     private readonly secrets: SecretStore,
     readonly provider: MessagingInstallProvider,
     _cleanupJobs?: Pick<JobPublisher, "enqueue">,
-    private readonly retirement?: {
-      capture: (tx: Pick<PrismaClient, "$queryRaw">, installationId: string) => Promise<string>;
-      enqueue: (tx: Pick<PrismaClient, "$queryRaw">, workItemId: string) => Promise<void>;
+    private readonly credentials?: {
+      register: (tx: Pick<PrismaClient, "$queryRaw">, objectKey: string) => Promise<void>;
+      recordOrphan: (objectKey: string) => Promise<void>;
+      retirement?: {
+        capture: (tx: Pick<PrismaClient, "$queryRaw">, installationId: string) => Promise<string>;
+        enqueue: (tx: Pick<PrismaClient, "$queryRaw">, workItemId: string) => Promise<void>;
+      };
     },
   ) {}
 
@@ -114,6 +118,9 @@ export class MessagingInstallations implements MessagingInstallationStore {
         ? installationSenderAddress(external.workspaceId, external.ownerId)
         : null;
       const previousCiphertext = existing?.ciphertext;
+      if (existing && !this.credentials?.retirement) {
+        throw new Error("credential cleanup worker is not configured");
+      }
       const sealed = await this.secrets.put(
         external.credential,
         {
@@ -127,9 +134,11 @@ export class MessagingInstallations implements MessagingInstallationStore {
       );
       try {
         await this.prisma.$transaction(async (tx) => {
+          if (!this.credentials) throw new Error("credential object registry is not configured");
+          await this.credentials.register(tx, sealed.ciphertext);
           const retiring =
             previousCiphertext && previousCiphertext !== sealed.ciphertext
-              ? await this.captureRetirement(tx, id)
+              ? await this.credentials.retirement!.capture(tx, id)
               : undefined;
           if (existing) {
             // Compare owner and previous ciphertext: disconnect/reinstall must not be undone.
@@ -164,7 +173,7 @@ export class MessagingInstallations implements MessagingInstallationStore {
               },
             });
           }
-          if (retiring) await this.retirement?.enqueue(tx, retiring);
+          if (retiring) await this.credentials?.retirement?.enqueue(tx, retiring);
         });
       } catch (error) {
         // A transport error may happen after a committed write; never remove a referenced secret.
@@ -173,8 +182,7 @@ export class MessagingInstallations implements MessagingInstallationStore {
             where: { id },
             select: { ciphertext: true },
           });
-          if (current?.ciphertext !== sealed.ciphertext)
-            await this.cleanupCredential(sealed.ciphertext, id);
+          if (current?.ciphertext !== sealed.ciphertext) await this.recordOrphan(sealed.ciphertext);
         } catch {
           getLogger().warn("unused messaging credential cleanup failed");
         }
@@ -258,8 +266,11 @@ export class MessagingInstallations implements MessagingInstallationStore {
     userId: string;
     ciphertext: string;
   }) {
+    if (!this.credentials?.retirement) {
+      throw new Error("credential cleanup worker is not configured");
+    }
     const removed = await this.prisma.$transaction(async (tx) => {
-      const retiring = await this.captureRetirement(tx, installation.id);
+      const retiring = await this.credentials!.retirement!.capture(tx, installation.id);
       await tx.messagingIdentity.deleteMany({
         where: {
           spaceId: installation.spaceId,
@@ -276,7 +287,7 @@ export class MessagingInstallations implements MessagingInstallationStore {
         },
       });
       if (result.count !== 1) throw new Error("Workspace connection changed; try again");
-      await this.retirement?.enqueue(tx, retiring);
+      await this.credentials?.retirement?.enqueue(tx, retiring);
       return true;
     });
     if (!removed) return;
@@ -315,23 +326,12 @@ export class MessagingInstallations implements MessagingInstallationStore {
       return { ...installation, credential: await this.secrets.load(ciphertext, row.id) };
     });
   }
-  private async captureRetirement(
-    tx: Pick<PrismaClient, "$queryRaw">,
-    installationId: string,
-  ): Promise<string> {
-    if (!this.retirement) throw new Error("credential retirement is not configured");
-    return this.retirement.capture(tx, installationId);
-  }
-
-  private async cleanupCredential(ref: string, installationId: string): Promise<void> {
+  private async recordOrphan(objectKey: string): Promise<void> {
     try {
-      await this.secrets.delete(ref, installationId);
+      if (!this.credentials) throw new Error("credential object registry is not configured");
+      await this.credentials.recordOrphan(objectKey);
     } catch {
-      // This reference was never committed on an installation row, so there is no
-      // retirement record to retry. Do not queue the reference itself.
-      getLogger().warn("uncommitted messaging credential could not be deleted", {
-        installationId,
-      });
+      getLogger().warn("uncommitted messaging credential was not recorded");
     }
   }
 

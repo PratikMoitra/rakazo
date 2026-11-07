@@ -1,8 +1,13 @@
 // Phase-1 addition for the isolated workspace slice. Apache-2.0; see LICENSE. Not an upstream Rakazo file.
 import { execFile } from "node:child_process";
-import type { BackgroundJobHandlers } from "@rakazo/adapter-kit";
-import { GraphileJobWorkerHost, performCredentialCleanup } from "@rakazo/adapters";
-import { countLegacyCredentialJobs, createDb, createPool } from "@rakazo/db";
+import { performCredentialCleanup } from "@rakazo/adapters";
+import {
+  countLegacyCredentialJobs,
+  createDb,
+  createPool,
+  installQueueBoundary,
+  preflightCredentialWorker,
+} from "@rakazo/db";
 import { expect, it } from "vitest";
 
 const databaseUrl = process.env.VERIFY_DATABASE === "1" ? process.env.DATABASE_URL : undefined;
@@ -12,7 +17,7 @@ it.skipIf(!databaseUrl)(
   async () => {
     const adminUrl = new URL(databaseUrl!);
     const workerUrl = new URL(databaseUrl!);
-    workerUrl.username = "rakazo_phase1_worker";
+    workerUrl.username = "rakazo_credential_worker";
     workerUrl.password = "phase1-worker-password";
     const apiUrl = new URL(databaseUrl!);
     apiUrl.username = "rakazo_phase1_api";
@@ -27,8 +32,42 @@ it.skipIf(!databaseUrl)(
       GRANT CONNECT ON DATABASE ${adminUrl.pathname.slice(1)} TO rakazo_phase1_api;
       GRANT rakazo_app TO rakazo_phase1_api;`,
     );
-    await runMigrate(workerUrl);
     const admin = createPool(databaseUrl!);
+    const ownerBefore = await admin.query<{ rolcanlogin: boolean }>(
+      "SELECT rolcanlogin FROM pg_roles WHERE rolname = 'rakazo_queue_owner'",
+    );
+    const reserved = new URL(databaseUrl!);
+    reserved.username = "rakazo_queue_owner";
+    reserved.password = "not-used";
+    await expect(preflightCredentialWorker(databaseUrl!, reserved.toString())).rejects.toThrow(
+      /managed credential worker/,
+    );
+    const ownerAfter = await admin.query<{ rolcanlogin: boolean }>(
+      "SELECT rolcanlogin FROM pg_roles WHERE rolname = 'rakazo_queue_owner'",
+    );
+    expect(ownerAfter.rows).toEqual(ownerBefore.rows);
+    const wrongDatabase = new URL(workerUrl.toString());
+    wrongDatabase.pathname = "/not-the-credential-database";
+    await expect(preflightCredentialWorker(databaseUrl!, wrongDatabase.toString())).rejects.toThrow(
+      /same database/,
+    );
+    await admin.query("CREATE SCHEMA IF NOT EXISTS queue_private");
+    await admin.query(
+      `CREATE TABLE IF NOT EXISTS queue_private.work_item (id uuid PRIMARY KEY, entity jsonb NOT NULL)`,
+    );
+    await admin.query(
+      `INSERT INTO queue_private.work_item (id, entity)
+       VALUES ('00000000-0000-4000-8000-000000000001', '{"tombstoneId":"00000000-0000-4000-8000-000000000002"}')`,
+    );
+    await expect(installQueueBoundary(databaseUrl!)).rejects.toThrow(/upgrade refused/);
+    const kept = await admin.query<{ n: number }>(
+      "SELECT count(*)::int AS n FROM queue_private.work_item WHERE id = '00000000-0000-4000-8000-000000000001'",
+    );
+    expect(kept.rows[0]?.n).toBe(1);
+    await admin.query(
+      "DELETE FROM queue_private.work_item WHERE id = '00000000-0000-4000-8000-000000000001'",
+    );
+    await runMigrate(workerUrl);
     const api = createPool(apiUrl.toString());
     const worker = createPool(workerUrl.toString());
     const created = createDb(databaseUrl!);
@@ -115,6 +154,7 @@ it.skipIf(!databaseUrl)(
          VALUES ($1, 'Cleanup', $2, $3, 'ink', now(), now()) ON CONFLICT (id) DO NOTHING`,
         [botId, spaceId, userId],
       );
+      await admin.query("SELECT queue_api.register_active_credential('retired-a')");
       await admin.query(
         `INSERT INTO messaging_installations
            (id, provider, "workspaceId", "workspaceName", "spaceId", "userId", "botId", ciphertext, "createdAt", "updatedAt")
@@ -149,6 +189,7 @@ it.skipIf(!databaseUrl)(
           [workItemId],
         );
         expect(version.rows[0]?.version).toBe(1);
+        await client.query("SELECT queue_api.register_active_credential('current-b')");
         await client.query(
           `UPDATE messaging_installations SET ciphertext = 'current-b' WHERE id = 'phase1-install'`,
         );
@@ -166,20 +207,20 @@ it.skipIf(!databaseUrl)(
         [`credential-cleanup:${workItemId}`],
       );
       expect(payload.rows).toEqual([{ only_id: true }]);
-      const host = new GraphileJobWorkerHost(worker, {
-        credentialCleanup: true,
-        concurrency: 1,
-        pollInterval: 100,
-        drainTimeoutMs: 1000,
-      });
-      await host.start({
-        "messaging.credential-cleanup": async ({ workItemId: id }) => {
-          await performCredentialCleanup({ pool: worker, secretStore }, id);
-        },
-      } as BackgroundJobHandlers);
-      await waitFor(() => deleted.length === 1);
-      await host.stop();
+      expect(
+        await sqlState(
+          admin,
+          "UPDATE messaging_installations SET ciphertext = 'retired-a' WHERE id = 'phase1-install'",
+        ),
+      ).toBe("23514");
+      const stillCurrent = await admin.query<{ ok: boolean }>(
+        "SELECT ciphertext = 'current-b' AS ok FROM messaging_installations WHERE id = 'phase1-install'",
+      );
+      expect(stillCurrent.rows[0]?.ok).toBe(true);
+      const child = await runCleanupProcess(workerUrl, workItemId);
+      expect(child).toBe("deleted");
       expect(secrets.get("current-b")).toBe(1);
+      deleted.push("retired-a");
       await performCredentialCleanup({ pool: worker, secretStore }, workItemId);
       expect(deleted).toHaveLength(1);
       await admin.query(
@@ -219,6 +260,7 @@ it.skipIf(!databaseUrl)(
       );
       expect(purged.rows[0]?.removed).toBeGreaterThanOrEqual(1);
 
+      await admin.query("SELECT queue_api.register_active_credential('same-ref')");
       await admin.query(
         `INSERT INTO messaging_installations
            (id, provider, "workspaceId", "workspaceName", "spaceId", "userId", "botId", ciphertext, "createdAt", "updatedAt")
@@ -240,27 +282,24 @@ it.skipIf(!databaseUrl)(
       );
       expect(skippedState.rows[0]).toEqual({ state: "skipped_current", retired_ref: null });
 
-      await admin.query(
-        `DELETE FROM graphile_worker._private_jobs AS jobs
-         USING graphile_worker._private_tasks AS tasks
-         WHERE jobs.task_id = tasks.id
-           AND tasks.identifier = 'messaging.credential-cleanup'
-           AND jobs.locked_at IS NULL`,
-      );
-      await admin.query(
-        `SELECT graphile_worker.add_job(
-           'messaging.credential-cleanup'::text,
-           json_build_object('installationId', 'phase1-install', 'ref', 'legacy-ref'),
-           NULL::text, NULL::timestamptz, 5, 'phase1-legacy-cleanup'::text,
-           NULL::integer, NULL::text[], 'replace'::text)`,
-      );
-      expect(await countLegacyCredentialJobs(admin)).toBe(1);
-      await admin.query("SELECT graphile_worker.remove_job('phase1-legacy-cleanup'::text)");
-      expect(await countLegacyCredentialJobs(admin)).toBe(0);
+      const beforeLegacy = await countLegacyCredentialJobs(admin);
+      const legacy = await admin.connect();
+      try {
+        await legacy.query("BEGIN");
+        await legacy.query(
+          `SELECT graphile_worker.add_job(
+             'messaging.credential-cleanup'::text,
+             json_build_object('installationId', 'phase1-install', 'ref', 'legacy-ref'),
+             NULL::text, NULL::timestamptz, 5, 'phase1-legacy-cleanup'::text,
+             NULL::integer, NULL::text[], 'replace'::text)`,
+        );
+        expect(await countLegacyCredentialJobs(legacy)).toBe(beforeLegacy + 1);
+        await legacy.query("ROLLBACK");
+      } finally {
+        legacy.release();
+      }
+      expect(await countLegacyCredentialJobs(admin)).toBe(beforeLegacy);
     } finally {
-      await admin
-        .query("SELECT graphile_worker.remove_job('phase1-legacy-cleanup'::text)")
-        .catch(() => undefined);
       await admin.end();
       await api.end();
       await worker.end();
@@ -269,14 +308,6 @@ it.skipIf(!databaseUrl)(
   },
   120_000,
 );
-
-async function waitFor(ready: () => boolean) {
-  const start = Date.now();
-  while (!ready()) {
-    if (Date.now() - start > 20_000) throw new Error("worker did not finish credential cleanup");
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
-}
 
 async function sqlState(
   pool: { query: (sql: string) => Promise<unknown> },
@@ -288,6 +319,32 @@ async function sqlState(
     return (error as { code?: string }).code ?? "";
   }
   return "";
+}
+
+function runCleanupProcess(workerUrl: URL, workItemId: string) {
+  return new Promise<string>((resolve, reject) => {
+    execFile(
+      "pnpm",
+      ["--filter", "@rakazo/api", "exec", "tsx", "src/phase1-cleanup-once.ts"],
+      {
+        cwd: "/workspace",
+        env: {
+          ...process.env,
+          DATABASE_WORKER_URL: workerUrl.toString(),
+          PHASE1_WORK_ITEM_ID: workItemId,
+        },
+      },
+      (error, stdout, stderr) => {
+        if (error) {
+          reject(
+            new Error(
+              (stderr || stdout || error.message).replaceAll(workerUrl.toString(), "[worker]"),
+            ),
+          );
+        } else resolve(stdout.trim());
+      },
+    );
+  });
 }
 
 function runMigrate(workerUrl: URL) {

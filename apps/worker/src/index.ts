@@ -78,6 +78,8 @@ import {
   reconcileComputerUpdates,
   reconcileMediaVideos,
   reconcilePurchases,
+  recordOrphanCredential,
+  registerActiveCredential,
   resolveDeploymentModel,
   resolvePiSessionRoot,
   resolveSandboxProvider,
@@ -275,8 +277,18 @@ async function main() {
     legacyMessaging,
     jobs,
     {
-      capture: (tx, installationId) => captureCredentialRetirement(tx, installationId),
-      enqueue: (tx, workItemId) => enqueueCredentialRetirement(tx, workItemId),
+      register: (tx, objectKey) => registerActiveCredential(tx, objectKey),
+      recordOrphan: (objectKey) => recordOrphanCredential(prisma, objectKey),
+      ...(credentialWorker.mode === "on"
+        ? {
+            retirement: {
+              capture: (tx: Parameters<typeof captureCredentialRetirement>[0], id: string) =>
+                captureCredentialRetirement(tx, id),
+              enqueue: (tx: Parameters<typeof enqueueCredentialRetirement>[0], id: string) =>
+                enqueueCredentialRetirement(tx, id),
+            },
+          }
+        : {}),
     },
   );
   const ticketChanges = createTicketChangeNotifier({

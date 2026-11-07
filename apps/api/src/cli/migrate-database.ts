@@ -9,6 +9,7 @@ import {
   databaseUrls,
   deployMigrations,
   installQueueBoundary,
+  preflightCredentialWorker,
   provisionCredentialWorker,
   provisionRuntimeRole,
   RUNTIME_ROLE,
@@ -18,6 +19,10 @@ import {
 loadRootEnv();
 await unwrapEnvFromKeyManager();
 const urls = databaseUrls(process.env);
+const credentialWorker = credentialWorkerTarget(urls.url, process.env.DATABASE_WORKER_URL);
+if (credentialWorker.mode === "on") {
+  await preflightCredentialWorker(urls.migrationUrl, credentialWorker.url);
+}
 await deployMigrations({
   migrationUrl: urls.migrationUrl,
   previousMigrations: process.env.RAKAZO_DEPLOYED_MIGRATIONS?.split(","),
@@ -27,7 +32,6 @@ await deployMigrations({
 });
 await migrateJobQueue(urls.migrationUrl);
 await installQueueBoundary(urls.migrationUrl);
-const credentialWorker = credentialWorkerTarget(urls.url, process.env.DATABASE_WORKER_URL);
 if (credentialWorker.mode === "on") {
   await provisionCredentialWorker(urls.migrationUrl, credentialWorker.url);
 }

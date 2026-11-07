@@ -12,7 +12,12 @@ import {
   teamChatRunFromOwner,
 } from "@rakazo/db";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { captureCredentialRetirement, enqueueCredentialRetirement } from "./credential-cleanup.js";
+import {
+  captureCredentialRetirement,
+  enqueueCredentialRetirement,
+  recordOrphanCredential,
+  registerActiveCredential,
+} from "./credential-cleanup.js";
 import { MessagingInstallations } from "./messaging-installations.js";
 import { EncryptedSecretStore } from "./secrets.js";
 import { SlackInstallProvider } from "./slack-install-provider.js";
@@ -78,8 +83,12 @@ describePostgres("messaging workspace installation (PostgreSQL)", () => {
       ),
       undefined,
       {
-        capture: (tx, installationId) => captureCredentialRetirement(tx, installationId),
-        enqueue: (tx, workItemId) => enqueueCredentialRetirement(tx, workItemId),
+        register: (tx, objectKey) => registerActiveCredential(tx, objectKey),
+        recordOrphan: (objectKey) => recordOrphanCredential(prisma, objectKey),
+        retirement: {
+          capture: (tx, installationId) => captureCredentialRetirement(tx, installationId),
+          enqueue: (tx, workItemId) => enqueueCredentialRetirement(tx, workItemId),
+        },
       },
     );
   });
@@ -296,6 +305,7 @@ describePostgres("messaging workspace installation (PostgreSQL)", () => {
     const personal = await asSystem(prisma).bot.create({
       data: { spaceId: actor.spaceId, userId: actor.userId, name: "Personal", color: "ink" },
     });
+    await registerActiveCredential(prisma, "fake-unused-ciphertext");
     const installation = await asSystem(prisma).messagingInstallation.create({
       data: {
         provider: "slack",

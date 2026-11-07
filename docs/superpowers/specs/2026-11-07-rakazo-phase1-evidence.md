@@ -33,11 +33,11 @@ The signed-in RPC body ceiling for a 26214400-byte file is 36001112 bytes. The l
 
 ## Queue boundary, credential cleanup only
 
-Credential cleanup copies the reference stored on the installation inside the rotation or disconnect transaction. The queue payload is `{workItemId}`. The reference lives in `queue_private.credential_retirement` until the worker finishes, then it is cleared. The functions are owned by `rakazo_queue_owner`, which is NOLOGIN, NOSUPERUSER, and NOBYPASSRLS. The API login can capture and enqueue. It cannot claim or read the retirement table. `pnpm db:migrate` provisions a distinct `DATABASE_WORKER_URL` when that variable is set. A blank URL or the same login as `DATABASE_URL` fails closed. An unset URL leaves cleanup off. Legacy cleanup jobs that still carry a reference make the worker refuse to start. They are not converted or deleted.
+Credential cleanup copies the reference stored on the installation inside the rotation or disconnect transaction. The queue payload is `{workItemId}`. The reference lives in `queue_private.credential_retirement` until the worker finishes, then it is cleared. The functions are owned by `rakazo_queue_owner`, which is NOLOGIN, NOSUPERUSER, and NOBYPASSRLS. The API login can capture and enqueue. It cannot claim or read the retirement table. `pnpm db:migrate` reads the worker URL before it changes roles. The only login it creates is `rakazo_credential_worker`. A reserved, blank, same-login, or wrong-database value is rejected without altering roles. The queue owner stays NOLOGIN. The installer does not drop an older retirement table. If that table or an older opaque job still has rows, migrate stops before DDL. Legacy raw-reference jobs are counted and left in place; the worker then refuses to start. They are not converted or deleted.
 
 The runtime login still has Graphile access for every other job. That is unresolved. This slice does not revoke those grants.
 
-The chunk-size and partial-body checks use a custom Node bridge. A separate listening test sends a chunked upload through the production HTTP adapter.
+The chunk-size and partial-body checks use a custom Node bridge. The production HTTP adapter was exercised with one 32-byte chunked upload. That does not cover the 26214400-byte boundary, abort, or parser rejection. The Graphile host used in earlier notes ran in the test process. A later cleanup check starts a separate OS process for one synthetic delete. There is no alert, backlog age, or cleanup SLA when the worker URL is unset: rotation and disconnect are rejected instead, and an uncommitted new object is recorded as an orphan without being deleted.
 
 ## Untested
 

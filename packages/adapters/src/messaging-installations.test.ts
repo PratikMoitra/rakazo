@@ -81,15 +81,21 @@ function fixture() {
     capture: vi.fn(async () => "5b0b5a6e-3e2a-4f5b-9c1d-6a7b8c9d0e1f"),
     enqueue: vi.fn(async () => undefined),
   };
+  const credentials = {
+    register: vi.fn(async () => undefined),
+    recordOrphan: vi.fn(async () => undefined),
+    retirement,
+  };
   return {
     cleanupJobs,
     retirement,
+    credentials,
     manager: new MessagingInstallations(
       prisma as unknown as PrismaClient,
       secrets,
       provider,
       cleanupJobs,
-      retirement,
+      credentials,
     ),
     prisma,
     provider,
@@ -246,7 +252,8 @@ it("removes an unreferenced secret if persisting an installation fails", async (
   const state = await begin(f);
   f.prisma.messagingInstallation.create.mockRejectedValueOnce(new Error("write failed"));
   await expect(f.manager.complete(actor, state, "code")).rejects.toThrow("write failed");
-  expect(f.secrets.delete).toHaveBeenCalledWith("sealed-token", expect.any(String));
+  expect(f.credentials.recordOrphan).toHaveBeenCalledWith("sealed-token");
+  expect(f.secrets.delete).not.toHaveBeenCalled();
 });
 
 it("does not delete a credential when a write committed before a transport error", async () => {

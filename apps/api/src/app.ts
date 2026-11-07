@@ -94,6 +94,8 @@ import {
   reconcileComputerUpdates,
   reconcileMediaVideos,
   reconcilePurchases,
+  recordOrphanCredential,
+  registerActiveCredential,
   removePiUserSessions,
   resolveDeploymentModel,
   ScriptedAgentRuntime,
@@ -132,6 +134,7 @@ import {
   createPool,
   createSecurityEventPruner,
   createThreadEvents,
+  credentialWorkerTarget,
   describeRowSecurity,
   IsolationError,
   installAuditEventStore,
@@ -474,8 +477,18 @@ async function buildApp(overrides: CreateAppOverrides): Promise<AppHandles> {
   const { messaging, installations: messagingInstallations } = messagingOverride
     ? { messaging: messagingOverride, installations: undefined }
     : installedMessaging(prisma, secrets, env, legacyMessaging, jobs, {
-        capture: (tx, installationId) => captureCredentialRetirement(tx, installationId),
-        enqueue: (tx, workItemId) => enqueueCredentialRetirement(tx, workItemId),
+        register: (tx, objectKey) => registerActiveCredential(tx, objectKey),
+        recordOrphan: (objectKey) => recordOrphanCredential(prisma, objectKey),
+        ...(credentialWorkerTarget(env.databaseUrl, process.env.DATABASE_WORKER_URL).mode === "on"
+          ? {
+              retirement: {
+                capture: (tx: Parameters<typeof captureCredentialRetirement>[0], id: string) =>
+                  captureCredentialRetirement(tx, id),
+                enqueue: (tx: Parameters<typeof enqueueCredentialRetirement>[0], id: string) =>
+                  enqueueCredentialRetirement(tx, id),
+              },
+            }
+          : {}),
       });
   const configuredEmail = emailOverride ?? configuredEmailProvider(env);
   const localEmailEmulator =

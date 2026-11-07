@@ -1,9 +1,26 @@
 // Phase-1 addition for the isolated workspace slice. Apache-2.0; see LICENSE. Not an upstream Rakazo file.
 import type { SecretStore } from "@rakazo/adapter-kit";
 import type { PrismaClient } from "@rakazo/db";
+import { CREDENTIAL_DELETE_TIMEOUT_MS } from "@rakazo/db";
 import type { Pool } from "pg";
 
 type RetirementClient = Pick<PrismaClient, "$queryRaw">;
+
+/** Registers a new physical object. A retiring, retired, or orphan object is refused. */
+export async function registerActiveCredential(
+  tx: RetirementClient,
+  objectKey: string,
+): Promise<void> {
+  await tx.$queryRaw`SELECT queue_api.register_active_credential(${objectKey}::text)`;
+}
+
+/** Records an object that was created and never committed. Does not delete it. */
+export async function recordOrphanCredential(
+  tx: RetirementClient,
+  objectKey: string,
+): Promise<void> {
+  await tx.$queryRaw`SELECT queue_api.record_orphan_credential(${objectKey}::text)`;
+}
 
 /** Copies the installation's current reference and returns the retirement id. */
 export async function captureCredentialRetirement(
@@ -45,11 +62,16 @@ export async function performCredentialCleanup(
   );
   const retirement = claimed.rows[0];
   if (!retirement) return;
+  const renewed = await deps.pool.query<{ ok: number }>(
+    "SELECT queue_api.renew_credential_lease($1::uuid, $2::uuid) AS ok",
+    [workItemId, retirement.fence],
+  );
+  if (renewed.rows[0]?.ok !== 1) return;
   try {
     try {
       await deps.secretStore.delete(retirement.retired_ref, {
         recordId: retirement.installation_id,
-        signal: AbortSignal.timeout(10_000),
+        signal: AbortSignal.timeout(CREDENTIAL_DELETE_TIMEOUT_MS),
       });
     } catch (error) {
       const code = (error as { code?: string }).code;
