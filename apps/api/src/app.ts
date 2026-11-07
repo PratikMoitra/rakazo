@@ -39,6 +39,7 @@ import {
   ChatSdkMessagingSurface,
   CodexCatalogCache,
   ComposioConnector,
+  captureCredentialRetirement,
   contentKeyProviderFromEnv,
   createAgentHomeStore,
   createApnsVoipProvider,
@@ -66,6 +67,7 @@ import {
   deploymentModelUsageLookup,
   EmailEmulator,
   ExpoPushProvider,
+  enqueueCredentialRetirement,
   GraphileJobPublisher,
   InMemoryJobQueue,
   InMemoryRealtimeFanout,
@@ -471,16 +473,10 @@ async function buildApp(overrides: CreateAppOverrides): Promise<AppHandles> {
       : undefined);
   const { messaging, installations: messagingInstallations } = messagingOverride
     ? { messaging: messagingOverride, installations: undefined }
-    : installedMessaging(
-        prisma,
-        secrets,
-        env,
-        legacyMessaging,
-        jobs,
-        async ({ installationId, ref }) => {
-          await prisma.$queryRaw`SELECT queue_api.create_credential_cleanup(${installationId}::text, ${ref}::text)`;
-        },
-      );
+    : installedMessaging(prisma, secrets, env, legacyMessaging, jobs, {
+        capture: (tx, installationId) => captureCredentialRetirement(tx, installationId),
+        enqueue: (tx, workItemId) => enqueueCredentialRetirement(tx, workItemId),
+      });
   const configuredEmail = emailOverride ?? configuredEmailProvider(env);
   const localEmailEmulator =
     !configuredEmail && env.emailEmulator

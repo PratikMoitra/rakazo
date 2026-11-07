@@ -1,25 +1,38 @@
 // Phase-1 addition for the isolated workspace slice. Apache-2.0; see LICENSE. Not an upstream Rakazo file.
-import { Client } from "pg";
+import { Client, escapeIdentifier, escapeLiteral } from "pg";
+import { scramSha256Verifier } from "./database-access.js";
+
+const QUEUE_OWNER = "rakazo_queue_owner";
+/** How long one worker may hold a retirement while it calls the secret store. */
+export const CREDENTIAL_RETIREMENT_LEASE_SECONDS = 5;
+/** Redacted retirement rows are removed after this many days. */
+export const CREDENTIAL_RETIREMENT_RETENTION_DAYS = 7;
 
 /**
- * The API login may call queue_api.create_credential_cleanup. That is trusted
- * application code, not a tenant SQL session: a tenant id is not an argument
- * and is not turned into system authority. The function stores the retired
- * reference in queue_private and enqueues only {workItemId}. It does not grant
- * the API login raw Graphile access. Callers must not log the reference.
- * rakazo_queue_owner owns the protected tables. The functions stay owned by
- * the migration role, which owns the Graphile tables, so enqueue is not blocked
- * by the runtime row policy. The function body does not accept a task name,
- * raw payload, or caller search path.
+ * Other background jobs still use the runtime login's Graphile grants. This
+ * module does not revoke those grants. Credential cleanup is the only job
+ * that has a private retirement record.
  *
- * Other background jobs still enqueue through Graphile as the runtime login.
- * Those grants stay until that publisher moves. Removing them in this migration
- * would stop the previous release during a rolling deploy.
+ * The definer is rakazo_queue_owner: NOLOGIN, NOSUPERUSER, NOBYPASSRLS. It is
+ * not the migration role. API is not a member of it. The functions do not take
+ * a credential reference; they copy the reference stored on the installation.
  */
-export async function installQueueBoundary(
-  migrationUrl: string,
-  workerLogin?: string,
-): Promise<void> {
+export function credentialWorkerTarget(
+  databaseUrl: string,
+  workerUrl: string | undefined,
+): { mode: "off" } | { mode: "on"; url: string; login: string } {
+  if (workerUrl === undefined) return { mode: "off" };
+  if (workerUrl.trim() === "") throw new Error("DATABASE_WORKER_URL is blank");
+  const workerLogin = loginOf(workerUrl);
+  const runtimeLogin = loginOf(databaseUrl);
+  if (!workerLogin) throw new Error("DATABASE_WORKER_URL must name a login");
+  if (workerLogin === runtimeLogin) {
+    throw new Error("DATABASE_WORKER_URL must not use the same login as DATABASE_URL");
+  }
+  return { mode: "on", url: workerUrl.trim(), login: workerLogin };
+}
+
+export async function installQueueBoundary(migrationUrl: string): Promise<void> {
   const owner = new Client({ connectionString: migrationUrl });
   await owner.connect();
   try {
@@ -28,66 +41,127 @@ export async function installQueueBoundary(
     );
     if (!ready.rows[0]?.ready) throw new Error("queue boundary needs the job schema");
     await owner.query(BOUNDARY_SQL);
-    if (workerLogin) {
-      const tables = await owner.query<{ name: string }>(
-        `SELECT c.relname AS name FROM pg_class c
-         WHERE c.relnamespace = 'graphile_worker'::regnamespace AND c.relrowsecurity`,
-      );
-      for (const table of tables.rows) {
-        const qualified = `graphile_worker.${quoteIdent(table.name)}`;
-        await owner.query(`DROP POLICY IF EXISTS rakazo_worker_queue ON ${qualified}`);
-        await owner.query(
-          `CREATE POLICY rakazo_worker_queue ON ${qualified} FOR ALL TO ${quoteIdent(workerLogin)} USING (true) WITH CHECK (true)`,
-        );
-      }
-      await owner.query(`GRANT USAGE ON SCHEMA queue_api TO ${quoteIdent(workerLogin)}`);
-      await owner.query(
-        `GRANT EXECUTE ON FUNCTION queue_api.credential_installation(uuid), queue_api.claim_retired_credential(uuid, text), queue_api.complete_credential_cleanup(uuid), queue_api.redact_dispatch_errors(), queue_api.rehearse_legacy_fixtures() TO ${quoteIdent(workerLogin)}`,
-      );
-      await owner.query(`GRANT USAGE ON SCHEMA graphile_worker TO ${quoteIdent(workerLogin)}`);
-      await owner.query(
-        `GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA graphile_worker TO ${quoteIdent(workerLogin)}`,
-      );
-      await owner.query(
-        `GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA graphile_worker TO ${quoteIdent(workerLogin)}`,
-      );
-      await owner.query(
-        `GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA graphile_worker TO ${quoteIdent(workerLogin)}`,
-      );
-    }
+    await grantDefinerQueueAccess(owner);
   } finally {
     await owner.end();
   }
 }
 
-/** Disposable rehearsal of the post-cutover API denial. Not applied on deploy. */
-export async function revokeRuntimeQueueAccess(migrationUrl: string): Promise<void> {
+/** Creates the worker login named by DATABASE_WORKER_URL and grants only cleanup execution. */
+export async function provisionCredentialWorker(
+  migrationUrl: string,
+  workerUrl: string,
+): Promise<void> {
+  const parsed = new URL(workerUrl);
+  const login = decodeURIComponent(parsed.username);
+  const password = decodeURIComponent(parsed.password);
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(login)) throw new Error("invalid worker login");
   const owner = new Client({ connectionString: migrationUrl });
   await owner.connect();
   try {
-    await owner.query(`
-      REVOKE ALL ON SCHEMA graphile_worker FROM rakazo_app, PUBLIC;
-      REVOKE ALL ON ALL TABLES IN SCHEMA graphile_worker FROM rakazo_app, PUBLIC;
-      REVOKE ALL ON ALL SEQUENCES IN SCHEMA graphile_worker FROM rakazo_app, PUBLIC;
-      REVOKE ALL ON ALL FUNCTIONS IN SCHEMA graphile_worker FROM rakazo_app, PUBLIC;
-    `);
-    const tables = await owner.query<{ name: string }>(
-      `SELECT c.relname AS name FROM pg_class c
-       WHERE c.relnamespace = 'graphile_worker'::regnamespace AND c.relrowsecurity`,
-    );
-    for (const table of tables.rows) {
+    const secret = password ? `PASSWORD ${escapeLiteral(scramSha256Verifier(password))}` : "";
+    const name = escapeIdentifier(login);
+    const existing = await owner.query("SELECT 1 FROM pg_roles WHERE rolname = $1", [login]);
+    if (!existing.rowCount) {
       await owner.query(
-        `DROP POLICY IF EXISTS rakazo_app_queue ON graphile_worker.${quoteIdent(table.name)}`,
+        `CREATE ROLE ${name} LOGIN ${secret} NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE`,
+      );
+    } else {
+      await owner.query(
+        `ALTER ROLE ${name} LOGIN ${secret} NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE`,
       );
     }
+    await owner.query(
+      `DO $$ BEGIN EXECUTE format('GRANT CONNECT ON DATABASE %I TO ${name}', current_database()); END $$`,
+    );
+    await owner.query(`GRANT USAGE ON SCHEMA queue_api, graphile_worker TO ${name}`);
+    await owner.query(`
+      GRANT EXECUTE ON FUNCTION
+        queue_api.claim_credential_retirement(uuid),
+        queue_api.complete_credential_retirement(uuid, uuid),
+        queue_api.redact_dispatch_errors(),
+        queue_api.purge_redacted_retirements(integer)
+      TO ${name}
+    `);
+    await owner.query(
+      `GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA graphile_worker TO ${name}`,
+    );
+    await owner.query(
+      `GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA graphile_worker TO ${name}`,
+    );
+    await owner.query(`GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA graphile_worker TO ${name}`);
+    await grantQueuePolicy(owner, "rakazo_credential_worker", login);
+    await owner.query(`
+      REVOKE EXECUTE ON FUNCTION
+        queue_api.claim_credential_retirement(uuid),
+        queue_api.complete_credential_retirement(uuid, uuid),
+        queue_api.redact_dispatch_errors(),
+        queue_api.purge_redacted_retirements(integer)
+      FROM PUBLIC, rakazo_app
+    `);
   } finally {
     await owner.end();
   }
 }
 
-function quoteIdent(name: string): string {
-  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) throw new Error("invalid role");
-  return `"${name}"`;
+export async function countLegacyCredentialJobs(query: {
+  query: (sql: string) => Promise<{ rows: Array<{ n: number }> }>;
+}): Promise<number> {
+  const found = await query.query(`
+    SELECT count(*)::int AS n
+    FROM graphile_worker._private_jobs AS jobs
+    JOIN graphile_worker._private_tasks AS tasks ON tasks.id = jobs.task_id
+    WHERE tasks.identifier = 'messaging.credential-cleanup'
+      AND jobs.payload::text LIKE '%"ref"%'
+      AND jobs.payload::text NOT LIKE '%"workItemId"%'
+  `);
+  return found.rows[0]?.n ?? 0;
+}
+
+async function grantDefinerQueueAccess(owner: Client): Promise<void> {
+  await owner.query(`
+    GRANT USAGE ON SCHEMA graphile_worker, public, queue_private, queue_api TO ${QUEUE_OWNER};
+    GRANT SELECT, UPDATE ON TABLE messaging_installations TO ${QUEUE_OWNER};
+    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA queue_private TO ${QUEUE_OWNER};
+    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA graphile_worker TO ${QUEUE_OWNER};
+    GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA graphile_worker TO ${QUEUE_OWNER};
+    GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA graphile_worker TO ${QUEUE_OWNER};
+  `);
+  await grantQueuePolicy(owner, "rakazo_queue_definer", QUEUE_OWNER);
+  await owner.query(`
+    DROP POLICY IF EXISTS rakazo_queue_owner_installation ON messaging_installations;
+    CREATE POLICY rakazo_queue_owner_installation ON messaging_installations
+      FOR ALL TO ${QUEUE_OWNER} USING (true) WITH CHECK (true);
+  `);
+  for (const name of [
+    "capture_current_credential(text)",
+    "enqueue_captured_credential(uuid)",
+    "claim_credential_retirement(uuid)",
+    "complete_credential_retirement(uuid, uuid)",
+    "redact_dispatch_errors()",
+    "purge_redacted_retirements(integer)",
+  ]) {
+    await owner.query(`ALTER FUNCTION queue_api.${name} OWNER TO ${QUEUE_OWNER}`);
+  }
+}
+
+async function grantQueuePolicy(owner: Client, policy: string, role: string): Promise<void> {
+  const tables = await owner.query<{ name: string }>(
+    `SELECT c.relname AS name FROM pg_class c
+     WHERE c.relnamespace = 'graphile_worker'::regnamespace AND c.relrowsecurity`,
+  );
+  for (const table of tables.rows) {
+    if (!/^[A-Za-z0-9_]+$/.test(table.name)) continue;
+    await owner.query(`DROP POLICY IF EXISTS ${policy} ON graphile_worker.${table.name}`);
+    await owner.query(
+      `CREATE POLICY ${policy} ON graphile_worker.${table.name}
+       FOR ALL TO ${role} USING (true) WITH CHECK (true)`,
+    );
+  }
+}
+
+function loginOf(url: string): string {
+  return decodeURIComponent(new URL(url).username);
 }
 
 const BOUNDARY_SQL = `
@@ -97,65 +171,96 @@ REVOKE ALL ON SCHEMA queue_private FROM PUBLIC;
 REVOKE ALL ON SCHEMA queue_api FROM PUBLIC;
 
 DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'rakazo_queue_owner') THEN
-    CREATE ROLE rakazo_queue_owner NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${QUEUE_OWNER}') THEN
+    CREATE ROLE ${QUEUE_OWNER} NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE;
   END IF;
 END $$;
+ALTER ROLE ${QUEUE_OWNER} NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE;
 
-CREATE TABLE IF NOT EXISTS queue_private.work_item (
-  id uuid PRIMARY KEY,
-  kind text NOT NULL,
-  entity jsonb NOT NULL,
-  created_at timestamptz NOT NULL DEFAULT now(),
-  CONSTRAINT queue_work_item_kind_check CHECK (kind = 'messaging.credential-cleanup'),
-  CONSTRAINT queue_work_item_entity_check CHECK (entity ? 'tombstoneId' AND NOT entity ? 'ref')
-);
+DROP FUNCTION IF EXISTS queue_api.create_credential_cleanup(text, text);
+DROP FUNCTION IF EXISTS queue_api.credential_installation(uuid);
+DROP FUNCTION IF EXISTS queue_api.claim_retired_credential(uuid, text);
+DROP FUNCTION IF EXISTS queue_api.complete_credential_cleanup(uuid);
+DROP FUNCTION IF EXISTS queue_api.rehearse_legacy_fixtures();
+DROP TABLE IF EXISTS queue_private.legacy_fixture;
+DROP TABLE IF EXISTS queue_private.credential_tombstone;
+DROP TABLE IF EXISTS queue_private.work_item;
 
-CREATE TABLE IF NOT EXISTS queue_private.credential_tombstone (
+CREATE TABLE IF NOT EXISTS queue_private.credential_retirement (
   id uuid PRIMARY KEY,
-  work_item_id uuid NOT NULL UNIQUE REFERENCES queue_private.work_item(id),
   installation_id text NOT NULL,
-  retired_ref text NOT NULL,
+  retired_ref text,
+  version integer NOT NULL,
   state text NOT NULL DEFAULT 'pending',
-  CONSTRAINT credential_tombstone_state_check CHECK (state IN ('pending', 'deleted', 'skipped_current'))
+  lease_fence uuid,
+  leased_until timestamptz,
+  redacted_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT credential_retirement_state_check
+    CHECK (state IN ('pending', 'leased', 'deleted', 'skipped_current'))
 );
+ALTER TABLE queue_private.credential_retirement OWNER TO ${QUEUE_OWNER};
+REVOKE ALL ON TABLE queue_private.credential_retirement FROM PUBLIC, rakazo_app;
+ALTER DEFAULT PRIVILEGES IN SCHEMA queue_api REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+ALTER DEFAULT PRIVILEGES IN SCHEMA queue_private REVOKE ALL ON TABLES FROM PUBLIC;
 
-CREATE TABLE IF NOT EXISTS queue_private.legacy_fixture (
-  id bigserial PRIMARY KEY,
-  task text NOT NULL,
-  payload jsonb NOT NULL,
-  last_error text,
-  locked boolean NOT NULL DEFAULT false,
-  attempts integer NOT NULL DEFAULT 0,
-  max_attempts integer NOT NULL DEFAULT 1
-);
-
-REVOKE ALL ON ALL TABLES IN SCHEMA queue_private FROM PUBLIC, rakazo_app;
-GRANT USAGE ON SCHEMA queue_private, queue_api, graphile_worker TO rakazo_queue_owner;
-GRANT ALL ON ALL TABLES IN SCHEMA queue_private TO rakazo_queue_owner;
-GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA graphile_worker TO rakazo_queue_owner;
-GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA graphile_worker TO rakazo_queue_owner;
-
-CREATE OR REPLACE FUNCTION queue_api.create_credential_cleanup(installation_id text, retired_ref text)
+CREATE OR REPLACE FUNCTION queue_api.capture_current_credential(installation_id text)
 RETURNS uuid
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog
 AS $fn$
 DECLARE
+  current_ref text;
+  next_version integer;
   item_id uuid := gen_random_uuid();
-  tomb_id uuid := gen_random_uuid();
 BEGIN
   IF installation_id IS NULL OR length(installation_id) < 1 OR length(installation_id) > 200 THEN
     RAISE EXCEPTION 'invalid installation' USING ERRCODE = '22023';
   END IF;
-  IF retired_ref IS NULL OR length(retired_ref) < 1 OR length(retired_ref) > 2000 THEN
-    RAISE EXCEPTION 'invalid credential reference' USING ERRCODE = '22023';
+  SELECT ciphertext INTO current_ref
+  FROM public.messaging_installations
+  WHERE id = installation_id
+  FOR UPDATE;
+  IF current_ref IS NULL OR length(current_ref) < 1 THEN
+    RAISE EXCEPTION 'installation has no credential' USING ERRCODE = '22023';
   END IF;
-  INSERT INTO queue_private.work_item (id, kind, entity)
-  VALUES (item_id, 'messaging.credential-cleanup', jsonb_build_object('tombstoneId', tomb_id));
-  INSERT INTO queue_private.credential_tombstone (id, work_item_id, installation_id, retired_ref)
-  VALUES (tomb_id, item_id, installation_id, retired_ref);
+  SELECT coalesce(max(version), 0) + 1 INTO next_version
+  FROM queue_private.credential_retirement
+  WHERE credential_retirement.installation_id = capture_current_credential.installation_id;
+  INSERT INTO queue_private.credential_retirement (id, installation_id, retired_ref, version)
+  VALUES (item_id, installation_id, current_ref, next_version);
+  RETURN item_id;
+END
+$fn$;
+
+DROP FUNCTION IF EXISTS queue_api.enqueue_captured_credential(uuid);
+CREATE OR REPLACE FUNCTION queue_api.enqueue_captured_credential(item_id uuid)
+RETURNS integer
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $fn$
+DECLARE
+  stored text;
+  installation text;
+  current_state text;
+  current_ref text;
+BEGIN
+  SELECT retired_ref, installation_id, state
+    INTO stored, installation, current_state
+  FROM queue_private.credential_retirement
+  WHERE id = item_id
+  FOR UPDATE;
+  IF installation IS NULL OR current_state <> 'pending' OR stored IS NULL THEN
+    RAISE EXCEPTION 'retirement cannot be enqueued' USING ERRCODE = '22023';
+  END IF;
+  SELECT ciphertext INTO current_ref
+  FROM public.messaging_installations
+  WHERE id = installation;
+  IF current_ref IS NOT NULL AND current_ref = stored THEN
+    RAISE EXCEPTION 'retirement is still the current credential' USING ERRCODE = '22023';
+  END IF;
   PERFORM graphile_worker.add_job(
     'work.dispatch'::text,
     json_build_object('workItemId', item_id)::json,
@@ -167,60 +272,81 @@ BEGIN
     NULL::text[],
     'replace'::text
   );
-  RETURN item_id;
+  RETURN 1;
 END
 $fn$;
 
-CREATE OR REPLACE FUNCTION queue_api.credential_installation(item_id uuid)
-RETURNS text
-LANGUAGE sql
-STABLE
-SECURITY DEFINER
-SET search_path = pg_catalog
-AS $fn$
-  SELECT installation_id FROM queue_private.credential_tombstone WHERE work_item_id = item_id
-$fn$;
-
-CREATE OR REPLACE FUNCTION queue_api.claim_retired_credential(item_id uuid, current_ciphertext text)
-RETURNS TABLE (installation_id text, retired_ref text)
+CREATE OR REPLACE FUNCTION queue_api.claim_credential_retirement(item_id uuid)
+RETURNS TABLE (installation_id text, retired_ref text, fence uuid)
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog
 AS $fn$
 DECLARE
-  inst text;
   stored text;
+  inst text;
   current_state text;
+  current_ref text;
+  held_until timestamptz;
+  next_fence uuid := gen_random_uuid();
 BEGIN
-  SELECT tomb.installation_id, tomb.retired_ref, tomb.state
-    INTO inst, stored, current_state
-  FROM queue_private.credential_tombstone AS tomb
-  WHERE tomb.work_item_id = item_id
+  SELECT retirement.retired_ref, retirement.installation_id, retirement.state, retirement.leased_until
+    INTO stored, inst, current_state, held_until
+  FROM queue_private.credential_retirement AS retirement
+  WHERE retirement.id = item_id
   FOR UPDATE;
-  IF inst IS NULL OR current_state <> 'pending' THEN
+  IF inst IS NULL OR stored IS NULL OR current_state IN ('deleted', 'skipped_current') THEN
     RETURN;
   END IF;
-  IF current_ciphertext IS NOT NULL AND stored = current_ciphertext THEN
-    UPDATE queue_private.credential_tombstone
-    SET state = 'skipped_current'
-    WHERE work_item_id = item_id AND state = 'pending';
+  IF current_state = 'leased' AND held_until IS NOT NULL AND held_until > clock_timestamp() THEN
     RETURN;
   END IF;
+  SELECT ciphertext INTO current_ref
+  FROM public.messaging_installations
+  WHERE id = inst;
+  IF current_ref IS NOT NULL AND current_ref = stored THEN
+    UPDATE queue_private.credential_retirement
+    SET state = 'skipped_current', retired_ref = NULL, redacted_at = clock_timestamp(),
+        lease_fence = NULL, leased_until = NULL
+    WHERE id = item_id;
+    RETURN;
+  END IF;
+  UPDATE queue_private.credential_retirement
+  SET state = 'leased', lease_fence = next_fence,
+      leased_until = clock_timestamp() + make_interval(secs => ${CREDENTIAL_RETIREMENT_LEASE_SECONDS})
+  WHERE id = item_id;
   installation_id := inst;
   retired_ref := stored;
+  fence := next_fence;
   RETURN NEXT;
 END
 $fn$;
 
-CREATE OR REPLACE FUNCTION queue_api.complete_credential_cleanup(item_id uuid)
+CREATE OR REPLACE FUNCTION queue_api.complete_credential_retirement(item_id uuid, fence uuid)
 RETURNS void
-LANGUAGE sql
+LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog
 AS $fn$
-  UPDATE queue_private.credential_tombstone
-  SET state = 'deleted'
-  WHERE work_item_id = item_id AND state = 'pending'
+DECLARE
+  updated integer;
+BEGIN
+  UPDATE queue_private.credential_retirement
+  SET state = 'deleted', retired_ref = NULL, redacted_at = clock_timestamp(),
+      lease_fence = NULL, leased_until = NULL
+  WHERE id = item_id AND state = 'leased' AND lease_fence = fence;
+  GET DIAGNOSTICS updated = ROW_COUNT;
+  IF updated = 1 THEN
+    RETURN;
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM queue_private.credential_retirement
+    WHERE id = item_id AND state = 'deleted' AND retired_ref IS NULL
+  ) THEN
+    RETURN;
+  END IF;
+  RAISE EXCEPTION 'retirement fence mismatch' USING ERRCODE = '22023';
+END
 $fn$;
 
 CREATE OR REPLACE FUNCTION queue_api.redact_dispatch_errors()
@@ -242,59 +368,32 @@ BEGIN
 END
 $fn$;
 
-CREATE OR REPLACE FUNCTION queue_api.rehearse_legacy_fixtures()
-RETURNS TABLE (converted integer, quarantined integer, unresolved integer)
+CREATE OR REPLACE FUNCTION queue_api.purge_redacted_retirements(retention_days integer)
+RETURNS integer
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog
 AS $fn$
 DECLARE
-  converted_count integer := 0;
-  quarantined_count integer := 0;
-  unresolved_count integer := 0;
-  fixture record;
-  item_id uuid;
-  tomb_id uuid;
+  removed integer;
 BEGIN
-  FOR fixture IN SELECT * FROM queue_private.legacy_fixture ORDER BY id LOOP
-    IF fixture.locked THEN
-      quarantined_count := quarantined_count + 1;
-      CONTINUE;
-    END IF;
-    IF fixture.task <> 'messaging.credential-cleanup'
-      OR coalesce(fixture.payload->>'ref', '') = '' THEN
-      unresolved_count := unresolved_count + 1;
-      CONTINUE;
-    END IF;
-    item_id := gen_random_uuid();
-    tomb_id := gen_random_uuid();
-    INSERT INTO queue_private.work_item (id, kind, entity)
-    VALUES (item_id, 'messaging.credential-cleanup', jsonb_build_object('tombstoneId', tomb_id));
-    INSERT INTO queue_private.credential_tombstone (id, work_item_id, installation_id, retired_ref)
-    VALUES (
-      tomb_id,
-      item_id,
-      coalesce(fixture.payload->>'installationId', 'unknown'),
-      fixture.payload->>'ref'
-    );
-    UPDATE queue_private.legacy_fixture
-    SET payload = jsonb_build_object('workItemId', item_id),
-        last_error = CASE WHEN last_error IS NULL THEN NULL ELSE 'redacted' END
-    WHERE id = fixture.id;
-    converted_count := converted_count + 1;
-  END LOOP;
-  converted := converted_count;
-  quarantined := quarantined_count;
-  unresolved := unresolved_count;
-  RETURN NEXT;
+  IF retention_days IS NULL OR retention_days < 0 OR retention_days > 3650 THEN
+    RAISE EXCEPTION 'invalid retention' USING ERRCODE = '22023';
+  END IF;
+  DELETE FROM queue_private.credential_retirement
+  WHERE state IN ('deleted', 'skipped_current')
+    AND retired_ref IS NULL
+    AND redacted_at IS NOT NULL
+    AND redacted_at < clock_timestamp() - make_interval(days => retention_days);
+  GET DIAGNOSTICS removed = ROW_COUNT;
+  RETURN removed;
 END
 $fn$;
 
 REVOKE ALL ON ALL FUNCTIONS IN SCHEMA queue_api FROM PUBLIC;
 GRANT USAGE ON SCHEMA queue_api TO rakazo_app;
-GRANT EXECUTE ON FUNCTION queue_api.create_credential_cleanup(text, text) TO rakazo_app;
-ALTER SCHEMA queue_private OWNER TO rakazo_queue_owner;
-ALTER TABLE queue_private.work_item OWNER TO rakazo_queue_owner;
-ALTER TABLE queue_private.credential_tombstone OWNER TO rakazo_queue_owner;
-ALTER TABLE queue_private.legacy_fixture OWNER TO rakazo_queue_owner;
+GRANT EXECUTE ON FUNCTION
+  queue_api.capture_current_credential(text),
+  queue_api.enqueue_captured_credential(uuid)
+TO rakazo_app;
 `;

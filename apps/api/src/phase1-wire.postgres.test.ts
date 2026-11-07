@@ -7,6 +7,7 @@ import type { AddressInfo } from "node:net";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { serve } from "@hono/node-server";
 import { asSystem } from "@rakazo/db";
 import { expect, it } from "vitest";
 import { createApp } from "./app.js";
@@ -177,6 +178,77 @@ it.skipIf(!databaseUrl)(
     }
   },
   180_000,
+);
+
+it.skipIf(!databaseUrl)(
+  "accepts a chunked upload through the production HTTP adapter",
+  async () => {
+    process.env.BETTER_AUTH_SECRET ??= "phase1-auth-secret-phase1-auth-secret";
+    process.env.ENCRYPTION_KEY ??= "phase1-encryption-key-phase1-encryption";
+    process.env.SCREEN_PROXY_SECRET ??= "phase1-screen-proxy-secret-32chars";
+    process.env.SANDBOX_SUPERVISOR_TOKEN ??= "phase1-supervisor-token-32chars-xx";
+    delete process.env.MAX_UPLOAD_SIZE_MB;
+    const dataDir = await mkdtemp(join(tmpdir(), "rakazo-phase1-hono-"));
+    const handles = await createApp({
+      databaseUrl: databaseUrl!,
+      dataDir,
+      sandboxProvider: "fake",
+      agentRuntime: "scripted",
+      wakeupDriver: "memory",
+      signupsEnabled: "true",
+      webOrigin: origin,
+      authUrl: origin,
+      uploadSizeExplicit: false,
+      maxUploadSizeBytes: 26_214_400,
+    });
+    const server = serve({ fetch: handles.app.fetch, hostname: "127.0.0.1", port: 0 });
+    await new Promise<void>((resolve) => server.once("listening", () => resolve()));
+    const port = (server.address() as AddressInfo).port;
+    try {
+      const signup = await fetch(`http://127.0.0.1:${port}/api/auth/sign-up/email`, {
+        method: "POST",
+        headers: { "content-type": "application/json", origin },
+        body: JSON.stringify({
+          email: `phase1-hono-${Date.now()}@example.test`,
+          password: "test-password-123",
+          name: "Hono",
+        }),
+      });
+      expect(signup.status).toBeLessThan(400);
+      const cookie =
+        signup.headers
+          .getSetCookie?.()
+          .map((value) => value.split(";")[0])
+          .join("; ") ?? "";
+      const bot = (await (
+        await fetch(`http://127.0.0.1:${port}/rpc/bots/create`, {
+          method: "POST",
+          headers: { "content-type": "application/json", cookie, origin },
+          body: JSON.stringify({
+            json: {
+              name: "Hono bot",
+              title: "",
+              description: "",
+              instructions: "",
+              notifyOnFinish: false,
+            },
+          }),
+        })
+      ).json()) as { json: { id: string } };
+      const uploaded = await chunkedUpload(port, cookie, bot.json.id, 32, "adapter.txt");
+      expect(uploaded.status).toBe(200);
+      const names = await asSystem(handles.prisma).artifact.findMany({
+        where: { botId: bot.json.id },
+        select: { name: true },
+      });
+      expect(names.map((row) => row.name)).toEqual(["adapter.txt"]);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await handles.stop();
+      await rm(dataDir, { recursive: true, force: true });
+    }
+  },
+  60_000,
 );
 
 async function forwardStream(

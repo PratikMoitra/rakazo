@@ -228,6 +228,8 @@ export class GraphileJobWorkerHost implements JobWorkerHost {
       sleep?: (ms: number) => Promise<void>;
       /** Test seam for JOB_DRAIN_TIMEOUT_MS. */
       drainTimeoutMs?: number;
+      /** Registers the opaque credential-cleanup dispatcher. Off unless the worker login is distinct. */
+      credentialCleanup?: boolean;
     } = {},
   ) {}
 
@@ -321,7 +323,11 @@ export class GraphileJobWorkerHost implements JobWorkerHost {
         ]),
     );
     if (!this.options.workload) taskList[INTERACTIVE_RUN_TASK] = taskList["run.continue"]!;
-    if (this.options.workload !== "interactive" && this.options.workload !== "background") {
+    if (
+      this.options.credentialCleanup &&
+      this.options.workload !== "interactive" &&
+      this.options.workload !== "background"
+    ) {
       taskList["work.dispatch"] = async (payload: unknown) => {
         const unpacked = unwrapJobPayload(payload);
         const body = unpacked.payload;
@@ -430,7 +436,7 @@ const MAINTENANCE_LOCAL_QUEUE_SIZE = 10;
 /** Long agent turns cannot occupy the capacity reserved for other workloads. */
 export function createReservedGraphileJobWorkerHost(
   pool: Pool,
-  options: { concurrency?: number; pollInterval?: number } = {},
+  options: { concurrency?: number; pollInterval?: number; credentialCleanup?: boolean } = {},
 ): JobWorkerHost {
   const hosts = (["interactive", "background", "maintenance"] as const).map(
     (workload) =>

@@ -19,7 +19,7 @@ The signed-in RPC body ceiling for a 26214400-byte file is 36001112 bytes. The l
 - In-process uploads of 26214399 and 26214400 bytes accepted, and 26214401 rejected with `upload_too_large`, on disposable Postgres.
 - In-process chunked small upload accepted. Unfinished body returned `upload_incomplete`. A short Content-Length with a body over the ceiling returned 413.
 - Listening-socket chunked uploads of 26214399 and 26214400 bytes accepted, and 26214401 rejected with `upload_too_large` and no artifact of that name. The server recorded a nonempty partial JSON body containing `contentBase64` before the client destroyed the socket. That request added no artifact. A chunk size of `ZZ` produced `HPE_INVALID_CHUNK_SIZE`, an HTTP 400, and no call into the upload route.
-- Two organization owners were denied `uploadPolicy/set` through the route and through a direct `setUploadPolicy` call. The configured deployment-admin email was denied while `emailVerified` was false, including a direct service call, and allowed after it was true. The change wrote one `upload.policy.changed` event with previous bytes, new bytes, and a sequence number. Repeating the same value did not write another.
+- Two organization owners were denied `uploadPolicy/set` on the route. The direct service call covered one of those owners and the unverified configured admin. The verified admin was then allowed. The change wrote one `upload.policy.changed` event with previous bytes, new bytes, and a sequence number. That sequence is the highest retained row plus one, not a lifetime counter. Repeating the same value did not write another.
 - Two concurrent requests for different byte counts produced ordered events. Two later requests for the same new value, starting from a different stored value, produced one transition. The sequence chain links each previous value to the prior new value without using `createdAt`. A trigger that rejects that audit insert returned a server error and left the stored value and event count unchanged. The trigger is dropped in `finally`.
 - An explicit environment ceiling locked the stored value for the verified admin.
 - A run-saved file of 3 MiB was rejected after the stored policy was 1 or 2 MiB, through the same finalizer the worker uses. No separate worker process was started.
@@ -31,13 +31,13 @@ The signed-in RPC body ceiling for a 26214400-byte file is 36001112 bytes. The l
 - Mobile source tests covered the advertised byte limit, a loopback default, a private custom server, and sign-in plus `me` against that server.
 - On a fresh disposable database, the ordered migration chain applied. Null, 1048576, and 26214400 were accepted. 0, 1, -1, a non-mebibyte, and a value above 26214400 were rejected by the check. A pre-existing invalid row made the check statement fail and stayed unchanged.
 
-## Queue boundary, partly moved
+## Queue boundary, credential cleanup only
 
-Credential cleanup now calls `queue_api.create_credential_cleanup`. The Graphile payload is `{workItemId}`. The retired reference stays in `queue_private.credential_tombstone`, which the API login cannot read. The worker login claims it, skips it when it is still current, deletes it once, and a second claim does nothing. Stored dispatch errors are rewritten to `redacted`. A fixture rehearsal converts synthetic legacy rows, including a failed row, and does not delete a locked row or a live unresolved Graphile job.
+Credential cleanup copies the reference stored on the installation inside the rotation or disconnect transaction. The queue payload is `{workItemId}`. The reference lives in `queue_private.credential_retirement` until the worker finishes, then it is cleared. The functions are owned by `rakazo_queue_owner`, which is NOLOGIN, NOSUPERUSER, and NOBYPASSRLS. The API login can capture and enqueue. It cannot claim or read the retirement table. `pnpm db:migrate` provisions a distinct `DATABASE_WORKER_URL` when that variable is set. A blank URL or the same login as `DATABASE_URL` fails closed. An unset URL leaves cleanup off. Legacy cleanup jobs that still carry a reference make the worker refuse to start. They are not converted or deleted.
 
-The API login used for that test is a member of `rakazo_app`. After a revoke rehearsal it cannot select, update, delete, insert, truncate, call `add_job`, or `SET ROLE` to the worker or queue owner. The worker login can read the dispatch row. Those runtime grants are restored at the end of the test.
+The runtime login still has Graphile access for every other job. That is unresolved. This slice does not revoke those grants.
 
-The rest of the publisher still writes entity ids through Graphile as the runtime login. Revoking those grants in a migration would stop the previous release, and this release, from enqueueing runs. `DATABASE_WORKER_URL` selects the worker pool when it is set. One bypass key still matches one runtime password, so the worker's tenant queries stay on `DATABASE_URL`. This is not tenant isolation and not a finished cutover.
+The chunk-size and partial-body checks use a custom Node bridge. A separate listening test sends a chunked upload through the production HTTP adapter.
 
 ## Untested
 

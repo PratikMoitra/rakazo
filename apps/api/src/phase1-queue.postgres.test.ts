@@ -1,165 +1,319 @@
 // Phase-1 addition for the isolated workspace slice. Apache-2.0; see LICENSE. Not an upstream Rakazo file.
 import { execFile } from "node:child_process";
-import {
-  installQueueBoundary,
-  restoreRuntimeQueueGrants,
-  revokeRuntimeQueueAccess,
-} from "@rakazo/db";
+import type { BackgroundJobHandlers } from "@rakazo/adapter-kit";
+import { GraphileJobWorkerHost, performCredentialCleanup } from "@rakazo/adapters";
+import { countLegacyCredentialJobs, createDb, createPool } from "@rakazo/db";
 import { expect, it } from "vitest";
 
-const migrationUrl = process.env.DATABASE_MIGRATION_URL ?? process.env.DATABASE_URL;
-const enabled = process.env.VERIFY_DATABASE === "1" && Boolean(migrationUrl);
-const sentinel = "phase1-dummy-retired-token";
+const databaseUrl = process.env.VERIFY_DATABASE === "1" ? process.env.DATABASE_URL : undefined;
 
-it.skipIf(!enabled)(
-  "separates the API login from queue rows and enqueues credential cleanup by work item id",
+it.skipIf(!databaseUrl)(
+  "provisions credential cleanup through the migrate CLI and a separate worker",
   async () => {
-    const admin = new URL(migrationUrl!);
-    const database = admin.pathname.slice(1);
+    const adminUrl = new URL(databaseUrl!);
+    const workerUrl = new URL(databaseUrl!);
+    workerUrl.username = "rakazo_phase1_worker";
+    workerUrl.password = "phase1-worker-password";
+    const apiUrl = new URL(databaseUrl!);
+    apiUrl.username = "rakazo_phase1_api";
+    apiUrl.password = "phase1-api-password";
     await psql(
-      admin,
-      `
-      DO $$ BEGIN
+      adminUrl,
+      `DO $$ BEGIN
         IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'rakazo_phase1_api') THEN
           CREATE ROLE rakazo_phase1_api LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE PASSWORD 'phase1-api-password';
         END IF;
-        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'rakazo_phase1_worker') THEN
-          CREATE ROLE rakazo_phase1_worker LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE PASSWORD 'phase1-worker-password';
-        END IF;
       END $$;
-    `,
+      GRANT CONNECT ON DATABASE ${adminUrl.pathname.slice(1)} TO rakazo_phase1_api;
+      GRANT rakazo_app TO rakazo_phase1_api;`,
     );
-    await psql(
-      admin,
-      `GRANT CONNECT ON DATABASE ${database} TO rakazo_phase1_api, rakazo_phase1_worker`,
-    );
-    await psql(admin, `GRANT rakazo_app TO rakazo_phase1_api`);
-    await installQueueBoundary(migrationUrl!, "rakazo_phase1_worker");
-    const api = new URL(migrationUrl!);
-    api.username = "rakazo_phase1_api";
-    api.password = "phase1-api-password";
-    const worker = new URL(migrationUrl!);
-    worker.username = "rakazo_phase1_worker";
-    worker.password = "phase1-worker-password";
+    await runMigrate(workerUrl);
+    const admin = createPool(databaseUrl!);
+    const api = createPool(apiUrl.toString());
+    const worker = createPool(workerUrl.toString());
+    const created = createDb(databaseUrl!);
+    const secrets = new Map<string, number>();
+    const deleted: string[] = [];
+    const secretStore = {
+      async delete(ref: string) {
+        const hits = secrets.get(ref) ?? 0;
+        if (hits === 0) {
+          const absent = new Error("absent");
+          throw Object.assign(absent, { code: "not_found" });
+        }
+        secrets.set(ref, hits - 1);
+        deleted.push(ref);
+      },
+    };
     try {
-      await revokeRuntimeQueueAccess(migrationUrl!);
-      for (const statement of [
-        "SELECT id FROM graphile_worker._private_jobs",
-        "UPDATE graphile_worker._private_jobs SET attempts = attempts",
-        "DELETE FROM graphile_worker._private_jobs",
-        "INSERT INTO graphile_worker._private_jobs DEFAULT VALUES",
-        "TRUNCATE graphile_worker._private_jobs",
-        "SELECT graphile_worker.add_job('run.continue'::text, '{}'::json)",
-        "SET ROLE rakazo_phase1_worker",
-        "SET ROLE rakazo_queue_owner",
-        "SELECT retired_ref FROM queue_private.credential_tombstone",
-      ]) {
-        const denied = await psql(api, statement);
-        expect(denied.ok, statement).toBe(false);
-        expect(denied.text.toLowerCase()).toContain("permission denied");
+      const owner = await admin.query<{
+        rolname: string;
+        rolsuper: boolean;
+        rolbypassrls: boolean;
+        rolcanlogin: boolean;
+      }>(`
+        SELECT r.rolname, r.rolsuper, r.rolbypassrls, r.rolcanlogin
+        FROM pg_proc AS fn
+        JOIN pg_namespace AS ns ON ns.oid = fn.pronamespace
+        JOIN pg_roles AS r ON r.oid = fn.proowner
+        WHERE ns.nspname = 'queue_api' AND fn.proname = 'capture_current_credential'
+      `);
+      expect(owner.rows).toEqual([
+        {
+          rolname: "rakazo_queue_owner",
+          rolsuper: false,
+          rolbypassrls: false,
+          rolcanlogin: false,
+        },
+      ]);
+      const searchPath = await admin.query<{ proconfig: string[] | null }>(`
+        SELECT fn.proconfig
+        FROM pg_proc AS fn
+        JOIN pg_namespace AS ns ON ns.oid = fn.pronamespace
+        WHERE ns.nspname = 'queue_api' AND fn.proname = 'claim_credential_retirement'
+      `);
+      expect(searchPath.rows[0]?.proconfig).toContain("search_path=pg_catalog");
+      const claimAllowed = await admin.query<{ allowed: boolean }>(
+        `SELECT has_function_privilege('rakazo_phase1_api', 'queue_api.claim_credential_retirement(uuid)', 'EXECUTE') AS allowed`,
+      );
+      expect(claimAllowed.rows[0]?.allowed).toBe(false);
+      const queueStillOpen = await admin.query<{ allowed: boolean }>(
+        `SELECT has_schema_privilege('rakazo_phase1_api', 'graphile_worker', 'USAGE') AS allowed`,
+      );
+      expect(queueStillOpen.rows[0]?.allowed).toBe(true);
+      expect(
+        await sqlState(api, "SELECT retired_ref FROM queue_private.credential_retirement"),
+      ).toBe("42501");
+      expect(
+        await sqlState(
+          api,
+          "SELECT * FROM queue_api.claim_credential_retirement('00000000-0000-0000-0000-000000000000'::uuid)",
+        ),
+      ).toBe("42501");
+
+      const userId = "phase1-cleanup-user";
+      const spaceId = "phase1-cleanup-space";
+      const botId = "phase1-cleanup-bot";
+      await admin.query(
+        `INSERT INTO "user" (id, name, email, "emailVerified", "createdAt", "updatedAt")
+         VALUES ($1, 'Cleanup', $2, true, now(), now())
+         ON CONFLICT (id) DO NOTHING`,
+        [userId, "phase1-cleanup@example.test"],
+      );
+      await admin.query(
+        `INSERT INTO organization (id, name, slug, "createdAt")
+         VALUES ($1, 'Cleanup', 'phase1-cleanup', now()) ON CONFLICT (id) DO NOTHING`,
+        [spaceId],
+      );
+      await admin.query(
+        `INSERT INTO spaces (id, name, "organizationId", "createdAt")
+         VALUES ($1, 'Cleanup', $1, now()) ON CONFLICT (id) DO NOTHING`,
+        [spaceId],
+      );
+      await admin.query(
+        `INSERT INTO bots (id, name, "spaceId", "userId", color, "createdAt", "updatedAt")
+         VALUES ($1, 'Cleanup', $2, $3, 'ink', now(), now()) ON CONFLICT (id) DO NOTHING`,
+        [botId, spaceId, userId],
+      );
+      await admin.query(
+        `INSERT INTO messaging_installations
+           (id, provider, "workspaceId", "workspaceName", "spaceId", "userId", "botId", ciphertext, "createdAt", "updatedAt")
+         VALUES ('phase1-install', 'slack', 'W-phase1', 'W', $1, $2, $3, 'retired-a', now(), now())
+         ON CONFLICT (id) DO UPDATE SET ciphertext = 'retired-a'`,
+        [spaceId, userId, botId],
+      );
+      await admin.query(
+        `DELETE FROM queue_private.credential_retirement WHERE installation_id IN ('phase1-install', 'phase1-install-2')`,
+      );
+      await admin.query(
+        `DELETE FROM graphile_worker._private_jobs AS jobs
+         USING graphile_worker._private_tasks AS tasks
+         WHERE jobs.task_id = tasks.id AND tasks.identifier = 'work.dispatch' AND jobs.locked_at IS NULL`,
+      );
+      secrets.set("retired-a", 1);
+      secrets.set("current-b", 1);
+      const client = await admin.connect();
+      let workItemId = "";
+      try {
+        await client.query("BEGIN");
+        const captured = await client.query<{ id: string }>(
+          "SELECT queue_api.capture_current_credential($1::text) AS id",
+          ["phase1-install"],
+        );
+        workItemId = captured.rows[0]?.id ?? "";
+        expect(workItemId).toMatch(
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+        );
+        const version = await client.query<{ version: number }>(
+          "SELECT version FROM queue_private.credential_retirement WHERE id = $1::uuid",
+          [workItemId],
+        );
+        expect(version.rows[0]?.version).toBe(1);
+        await client.query(
+          `UPDATE messaging_installations SET ciphertext = 'current-b' WHERE id = 'phase1-install'`,
+        );
+        await client.query("SELECT queue_api.enqueue_captured_credential($1::uuid)", [workItemId]);
+        await client.query("COMMIT");
+      } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+      } finally {
+        client.release();
       }
-      const created = await psql(
-        api,
-        `SELECT queue_api.create_credential_cleanup('install-phase1', '${sentinel}')`,
-      );
-      expect(created.ok).toBe(true);
-      const workItemId = created.text.trim().split("\n").at(-1)?.trim() ?? "";
-      expect(workItemId).toMatch(/^[0-9a-f-]{36}$/);
-      const payload = await psql(
-        worker,
+      const payload = await worker.query<{ only_id: boolean }>(
         `SELECT (payload::jsonb - 'workItemId') = '{}'::jsonb AS only_id
-         FROM graphile_worker._private_jobs WHERE key = 'credential-cleanup:${workItemId}'`,
+         FROM graphile_worker._private_jobs WHERE key = $1`,
+        [`credential-cleanup:${workItemId}`],
       );
-      expect(payload.ok).toBe(true);
-      expect(payload.text).toContain("t");
-      const matched = await psql(
-        worker,
-        `SELECT sha256(retired_ref::bytea) = sha256('${sentinel}'::bytea) AS same
-         FROM queue_api.claim_retired_credential('${workItemId}'::uuid, 'different-current')`,
+      expect(payload.rows).toEqual([{ only_id: true }]);
+      const host = new GraphileJobWorkerHost(worker, {
+        credentialCleanup: true,
+        concurrency: 1,
+        pollInterval: 100,
+        drainTimeoutMs: 1000,
+      });
+      await host.start({
+        "messaging.credential-cleanup": async ({ workItemId: id }) => {
+          await performCredentialCleanup({ pool: worker, secretStore }, id);
+        },
+      } as BackgroundJobHandlers);
+      await waitFor(() => deleted.length === 1);
+      await host.stop();
+      expect(secrets.get("current-b")).toBe(1);
+      await performCredentialCleanup({ pool: worker, secretStore }, workItemId);
+      expect(deleted).toHaveLength(1);
+      await admin.query(
+        `SELECT graphile_worker.add_job(
+           'work.dispatch'::text,
+           json_build_object('workItemId', $1::uuid),
+           NULL::text, NULL::timestamptz, 5, 'phase1-redact-probe'::text,
+           NULL::integer, NULL::text[], 'replace'::text)`,
+        [workItemId],
       );
-      expect(matched.text).toContain("t");
-      expect(matched.text).not.toContain(sentinel);
-      await psql(worker, `SELECT queue_api.complete_credential_cleanup('${workItemId}'::uuid)`);
-      const again = await psql(
-        worker,
-        `SELECT count(*) FROM queue_api.claim_retired_credential('${workItemId}'::uuid, 'different-current')`,
+      const redacted = await admin.query<{ last_error: string | null }>(
+        `UPDATE graphile_worker._private_jobs
+         SET last_error = 'SENTINEL-value'
+         WHERE key = 'phase1-redact-probe'
+         RETURNING last_error`,
       );
-      expect(again.text).toContain("0");
-      const second = await psql(
-        api,
-        `SELECT queue_api.create_credential_cleanup('install-phase1-current', '${sentinel}')`,
+      expect(redacted.rows[0]?.last_error).toBe("SENTINEL-value");
+      await worker.query("SELECT queue_api.redact_dispatch_errors()");
+      const cleaned = await worker.query<{ last_error: string | null }>(
+        "SELECT last_error FROM graphile_worker._private_jobs WHERE key = 'phase1-redact-probe'",
       );
-      const secondId = second.text.trim().split("\n").at(-1)?.trim() ?? "";
-      await psql(
-        worker,
-        `SELECT queue_api.claim_retired_credential('${secondId}'::uuid, '${sentinel}')`,
+      expect(cleaned.rows[0]?.last_error).toBe("redacted");
+      await admin.query("SELECT graphile_worker.remove_job('phase1-redact-probe'::text)");
+      const stored = await admin.query<{ retired_ref: string | null }>(
+        "SELECT retired_ref FROM queue_private.credential_retirement WHERE id = $1::uuid",
+        [workItemId],
       );
-      const skipped = await psql(
-        admin,
-        `SELECT state = 'skipped_current' AS skipped FROM queue_private.credential_tombstone WHERE work_item_id = '${secondId}'::uuid`,
+      expect(stored.rows[0]?.retired_ref).toBeNull();
+      await admin.query(
+        `UPDATE queue_private.credential_retirement
+         SET redacted_at = clock_timestamp() - interval '8 days'
+         WHERE id = $1::uuid`,
+        [workItemId],
       );
-      expect(skipped.text).toContain("t");
-      await psql(
-        worker,
-        `UPDATE graphile_worker._private_jobs SET last_error = '${sentinel}-error' WHERE key = 'credential-cleanup:${workItemId}'`,
+      const purged = await worker.query<{ removed: number }>(
+        "SELECT queue_api.purge_redacted_retirements(7) AS removed",
       );
-      await psql(worker, `SELECT queue_api.redact_dispatch_errors()`);
-      const redacted = await psql(
-        worker,
-        `SELECT last_error = 'redacted' AS redacted FROM graphile_worker._private_jobs WHERE key = 'credential-cleanup:${workItemId}'`,
+      expect(purged.rows[0]?.removed).toBeGreaterThanOrEqual(1);
+
+      await admin.query(
+        `INSERT INTO messaging_installations
+           (id, provider, "workspaceId", "workspaceName", "spaceId", "userId", "botId", ciphertext, "createdAt", "updatedAt")
+         VALUES ('phase1-install-2', 'slack', 'W-phase1-2', 'W', $1, $2, $3, 'same-ref', now(), now())
+         ON CONFLICT (id) DO UPDATE SET ciphertext = 'same-ref'`,
+        [spaceId, userId, botId],
       );
-      expect(redacted.text).toContain("t");
-      expect(redacted.text).not.toContain(sentinel);
-      const beforeJobs = await psql(
-        admin,
-        `SELECT count(*) AS n FROM graphile_worker._private_jobs WHERE key = 'phase1-legacy-locked'`,
+      const skip = await admin.query<{ id: string }>(
+        "SELECT queue_api.capture_current_credential('phase1-install-2') AS id",
       );
-      await psql(
-        admin,
-        `SELECT graphile_worker.add_job('messaging.credential-cleanup'::text, json_build_object('ref', '${sentinel}'), NULL::text, NULL::timestamptz, 5, 'phase1-legacy-locked'::text)`,
+      const skipped = await worker.query(
+        "SELECT installation_id FROM queue_api.claim_credential_retirement($1::uuid)",
+        [skip.rows[0]?.id],
       );
-      await psql(
-        admin,
-        `INSERT INTO queue_private.legacy_fixture (task, payload, last_error, locked, attempts, max_attempts)
-         VALUES
-         ('messaging.credential-cleanup', json_build_object('installationId', 'install-locked', 'ref', '${sentinel}'), '${sentinel}-error', true, 1, 5),
-         ('messaging.credential-cleanup', json_build_object('installationId', 'install-failed', 'ref', '${sentinel}'), '${sentinel}-error', false, 5, 5),
-         ('messaging.credential-cleanup', '{"installationId":"missing"}'::jsonb, '${sentinel}-error', false, 5, 5)`,
+      expect(skipped.rowCount).toBe(0);
+      const skippedState = await admin.query<{ state: string; retired_ref: string | null }>(
+        "SELECT state, retired_ref FROM queue_private.credential_retirement WHERE id = $1::uuid",
+        [skip.rows[0]?.id],
       );
-      const rehearsed = await psql(
-        worker,
-        `SELECT converted::text || ',' || quarantined::text || ',' || unresolved::text
-         FROM queue_api.rehearse_legacy_fixtures()`,
+      expect(skippedState.rows[0]).toEqual({ state: "skipped_current", retired_ref: null });
+
+      await admin.query(
+        `DELETE FROM graphile_worker._private_jobs AS jobs
+         USING graphile_worker._private_tasks AS tasks
+         WHERE jobs.task_id = tasks.id
+           AND tasks.identifier = 'messaging.credential-cleanup'
+           AND jobs.locked_at IS NULL`,
       );
-      expect(rehearsed.ok).toBe(true);
-      expect(rehearsed.text).toContain("1,1,1");
-      const afterJobs = await psql(
-        admin,
-        `SELECT count(*) AS n FROM graphile_worker._private_jobs WHERE key = 'phase1-legacy-locked'`,
+      await admin.query(
+        `SELECT graphile_worker.add_job(
+           'messaging.credential-cleanup'::text,
+           json_build_object('installationId', 'phase1-install', 'ref', 'legacy-ref'),
+           NULL::text, NULL::timestamptz, 5, 'phase1-legacy-cleanup'::text,
+           NULL::integer, NULL::text[], 'replace'::text)`,
       );
-      expect(afterJobs.text).toContain("1");
-      expect(beforeJobs.text).toContain("0");
-      const kept = await psql(
-        admin,
-        `SELECT
-           (bool_or(locked) AND bool_or(locked AND payload ? 'ref'))::text
-           || ',' ||
-           coalesce(bool_or(NOT locked AND payload ? 'ref'), false)::text
-           || ',' ||
-           (count(*) FILTER (WHERE NOT locked AND NOT payload ? 'ref') > 0)::text
-         FROM queue_private.legacy_fixture`,
-      );
-      expect(kept.text).toContain("true,false,true");
+      expect(await countLegacyCredentialJobs(admin)).toBe(1);
+      await admin.query("SELECT graphile_worker.remove_job('phase1-legacy-cleanup'::text)");
+      expect(await countLegacyCredentialJobs(admin)).toBe(0);
     } finally {
-      await psql(admin, `DELETE FROM queue_private.legacy_fixture`).catch?.(() => undefined);
-      await restoreRuntimeQueueGrants(migrationUrl!).catch(() => undefined);
+      await admin
+        .query("SELECT graphile_worker.remove_job('phase1-legacy-cleanup'::text)")
+        .catch(() => undefined);
+      await admin.end();
+      await api.end();
+      await worker.end();
+      await created.prisma.$disconnect();
     }
   },
   120_000,
 );
 
+async function waitFor(ready: () => boolean) {
+  const start = Date.now();
+  while (!ready()) {
+    if (Date.now() - start > 20_000) throw new Error("worker did not finish credential cleanup");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+async function sqlState(
+  pool: { query: (sql: string) => Promise<unknown> },
+  sql: string,
+): Promise<string> {
+  try {
+    await pool.query(sql);
+  } catch (error) {
+    return (error as { code?: string }).code ?? "";
+  }
+  return "";
+}
+
+function runMigrate(workerUrl: URL) {
+  return new Promise<void>((resolve, reject) => {
+    execFile(
+      "pnpm",
+      ["--filter", "@rakazo/api", "db:migrate"],
+      {
+        cwd: "/workspace",
+        env: { ...process.env, DATABASE_WORKER_URL: workerUrl.toString() },
+      },
+      (error, stdout, stderr) => {
+        if (error) {
+          reject(
+            new Error(
+              (stderr || stdout || error.message).replaceAll(workerUrl.toString(), "[worker]"),
+            ),
+          );
+        } else resolve();
+      },
+    );
+  });
+}
+
 function psql(url: URL, sql: string) {
-  return new Promise<{ ok: boolean; text: string }>((resolve) => {
+  return new Promise<void>((resolve, reject) => {
     execFile(
       "psql",
       [
@@ -173,14 +327,13 @@ function psql(url: URL, sql: string) {
         url.pathname.slice(1),
         "-v",
         "ON_ERROR_STOP=1",
-        "-t",
-        "-A",
         "-c",
         sql,
       ],
       { env: { ...process.env, PGPASSWORD: decodeURIComponent(url.password) } },
       (error, stdout, stderr) => {
-        resolve({ ok: !error, text: `${stdout}\n${stderr}` });
+        if (error) reject(new Error(stderr || stdout || error.message));
+        else resolve();
       },
     );
   });

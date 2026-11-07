@@ -5,9 +5,11 @@ import { execFileSync } from "node:child_process";
 import { migrateJobQueue, unwrapEnvFromKeyManager } from "@rakazo/adapters";
 import { loadRootEnv } from "@rakazo/core/node/load-root-env";
 import {
+  credentialWorkerTarget,
   databaseUrls,
   deployMigrations,
   installQueueBoundary,
+  provisionCredentialWorker,
   provisionRuntimeRole,
   RUNTIME_ROLE,
   SINGLE_DATABASE_URL_WARNING,
@@ -25,6 +27,10 @@ await deployMigrations({
 });
 await migrateJobQueue(urls.migrationUrl);
 await installQueueBoundary(urls.migrationUrl);
+const credentialWorker = credentialWorkerTarget(urls.url, process.env.DATABASE_WORKER_URL);
+if (credentialWorker.mode === "on") {
+  await provisionCredentialWorker(urls.migrationUrl, credentialWorker.url);
+}
 
 if (!urls.separate) {
   process.stderr.write(`WARNING: ${SINGLE_DATABASE_URL_WARNING}\n`);

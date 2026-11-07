@@ -15,7 +15,7 @@ export function installedMessaging(
   },
   fallback?: MessagingSurface,
   cleanupJobs?: Pick<JobPublisher, "enqueue">,
-  retireCredential?: (input: { installationId: string; ref: string }) => Promise<void>,
+  retirement?: ConstructorParameters<typeof MessagingInstallations>[4],
 ): { messaging: MessagingSurface | undefined; installations: MessagingInstallations | undefined } {
   if (
     (config.slackClientId || config.slackClientSecret) &&
@@ -45,7 +45,7 @@ export function installedMessaging(
     secrets,
     provider,
     cleanupJobs,
-    retireCredential,
+    retirement,
   );
   return {
     messaging: new InstalledMessagingSurface(installations, provider, fallback),

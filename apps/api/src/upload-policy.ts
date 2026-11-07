@@ -76,6 +76,7 @@ export async function setUploadPolicy(
       `;
       const previous = locked[0]?.maxUploadSizeBytes ?? null;
       if (previous === next.maxFileBytes) return { changed: false as const, previous };
+      // Highest retained sequence, not a lifetime counter. Pruning those rows can reuse a number.
       const [counted] = await tx.$queryRaw<Array<{ next: number }>>`
         SELECT coalesce(max((metadata->>'sequence')::int), 0) + 1 AS next
         FROM audit_events

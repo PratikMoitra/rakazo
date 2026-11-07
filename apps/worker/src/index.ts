@@ -21,6 +21,7 @@ import {
   auditLogConfig,
   ChatSdkMessagingSurface,
   CodexCatalogCache,
+  captureCredentialRetirement,
   configuredEmailProvider,
   contentKeyProviderFromEnv,
   createAgentHomeStore,
@@ -50,6 +51,7 @@ import {
   databaseCapacityBackoffMs,
   deploymentModelUsageLookup,
   ExpoPushProvider,
+  enqueueCredentialRetirement,
   GraphileJobPublisher,
   homeStorageSweeper,
   InMemoryJobQueue,
@@ -90,11 +92,13 @@ import {
 } from "@rakazo/adapters";
 import { resolveEncryptionKey, resolveSupervisorToken, uploadLimitFromEnv } from "@rakazo/core";
 import {
+  countLegacyCredentialJobs,
   createBoardEvents,
   createDb,
   createPool,
   createSecurityEventPruner,
   createThreadEvents,
+  credentialWorkerTarget,
   describeRowSecurity,
   installAuditEventStore,
   installSecurityEventStore,
@@ -131,10 +135,19 @@ async function main() {
     keyProvider: contentKeyProviderFromEnv(),
   });
   const { pool } = created;
-  const workerDatabaseUrl = process.env.DATABASE_WORKER_URL?.trim();
-  const queuePool = workerDatabaseUrl
-    ? createPool(workerDatabaseUrl, { applicationName: "rakazo-worker-queue" })
-    : pool;
+  const credentialWorker = credentialWorkerTarget(databaseUrl, process.env.DATABASE_WORKER_URL);
+  const queuePool =
+    credentialWorker.mode === "on"
+      ? createPool(credentialWorker.url, { applicationName: "rakazo-worker-queue" })
+      : pool;
+  if (process.env.WAKEUP_DRIVER !== "memory") {
+    const legacyJobs = await countLegacyCredentialJobs(queuePool);
+    if (legacyJobs > 0) {
+      throw new Error(
+        `credential cleanup refused to start: ${legacyJobs} legacy jobs are queued and conversion is not approved`,
+      );
+    }
+  }
   let { prisma } = created;
   const rowSecurity = rowSecurityWarning(await describeRowSecurity(prisma));
   if (rowSecurity) logger.warn(rowSecurity);
@@ -261,8 +274,9 @@ async function main() {
     },
     legacyMessaging,
     jobs,
-    async ({ installationId, ref }) => {
-      await prisma.$queryRaw`SELECT queue_api.create_credential_cleanup(${installationId}::text, ${ref}::text)`;
+    {
+      capture: (tx, installationId) => captureCredentialRetirement(tx, installationId),
+      enqueue: (tx, workItemId) => enqueueCredentialRetirement(tx, workItemId),
     },
   );
   const ticketChanges = createTicketChangeNotifier({
@@ -361,6 +375,7 @@ async function main() {
       new RunWorkerHost(prisma, realtime, runs, { pool }),
       createReservedGraphileJobWorkerHost(queuePool, {
         concurrency: parsePositiveInteger(process.env.GRAPHILE_WORKER_CONCURRENCY, 4),
+        credentialCleanup: credentialWorker.mode === "on",
       }),
     );
 
@@ -385,8 +400,11 @@ async function main() {
     notifications,
     mediaGeneration,
     maxUploadSizeBytes,
-    cleanupRetiredCredential: (workItemId) =>
-      performCredentialCleanup({ pool: queuePool, prisma, secretStore: secrets }, workItemId),
+    cleanupRetiredCredential:
+      credentialWorker.mode === "on"
+        ? (workItemId) =>
+            performCredentialCleanup({ pool: queuePool, secretStore: secrets }, workItemId)
+        : undefined,
   });
   const reconciler = createJobReconciler({
     prisma,

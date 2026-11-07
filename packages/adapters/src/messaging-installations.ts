@@ -20,10 +20,10 @@ export class MessagingInstallations implements MessagingInstallationStore {
     private readonly secrets: SecretStore,
     readonly provider: MessagingInstallProvider,
     _cleanupJobs?: Pick<JobPublisher, "enqueue">,
-    private readonly retireCredential?: (input: {
-      installationId: string;
-      ref: string;
-    }) => Promise<void>,
+    private readonly retirement?: {
+      capture: (tx: Pick<PrismaClient, "$queryRaw">, installationId: string) => Promise<string>;
+      enqueue: (tx: Pick<PrismaClient, "$queryRaw">, workItemId: string) => Promise<void>;
+    },
   ) {}
 
   /** Without a chosen bot, the workspace answers as the user's first bot in the current space. */
@@ -126,39 +126,46 @@ export class MessagingInstallations implements MessagingInstallationStore {
         { recordId: id },
       );
       try {
-        if (existing) {
-          // Compare owner and previous ciphertext: disconnect/reinstall must not be undone.
-          const updated = await this.prisma.messagingInstallation.updateMany({
-            where: {
-              id,
-              spaceId: session.spaceId,
-              userId: session.userId,
-              botId: session.botId,
-              ciphertext: previousCiphertext,
-            },
-            data: {
-              ciphertext: sealed.ciphertext,
-              workspaceName: external.workspaceName,
-              ownerAddress,
-            },
-          });
-          if (updated.count !== 1) throw new Error("Workspace connection changed; try again");
-        } else {
-          // The unique workspace key prevents concurrent installs claiming two tenants.
-          await this.prisma.messagingInstallation.create({
-            data: {
-              id,
-              provider: session.provider,
-              workspaceId: external.workspaceId,
-              workspaceName: external.workspaceName,
-              spaceId: session.spaceId,
-              userId: session.userId,
-              botId: session.botId,
-              ciphertext: sealed.ciphertext,
-              ownerAddress,
-            },
-          });
-        }
+        await this.prisma.$transaction(async (tx) => {
+          const retiring =
+            previousCiphertext && previousCiphertext !== sealed.ciphertext
+              ? await this.captureRetirement(tx, id)
+              : undefined;
+          if (existing) {
+            // Compare owner and previous ciphertext: disconnect/reinstall must not be undone.
+            const updated = await tx.messagingInstallation.updateMany({
+              where: {
+                id,
+                spaceId: session.spaceId,
+                userId: session.userId,
+                botId: session.botId,
+                ciphertext: previousCiphertext,
+              },
+              data: {
+                ciphertext: sealed.ciphertext,
+                workspaceName: external.workspaceName,
+                ownerAddress,
+              },
+            });
+            if (updated.count !== 1) throw new Error("Workspace connection changed; try again");
+          } else {
+            // The unique workspace key prevents concurrent installs claiming two tenants.
+            await tx.messagingInstallation.create({
+              data: {
+                id,
+                provider: session.provider,
+                workspaceId: external.workspaceId,
+                workspaceName: external.workspaceName,
+                spaceId: session.spaceId,
+                userId: session.userId,
+                botId: session.botId,
+                ciphertext: sealed.ciphertext,
+                ownerAddress,
+              },
+            });
+          }
+          if (retiring) await this.retirement?.enqueue(tx, retiring);
+        });
       } catch (error) {
         // A transport error may happen after a committed write; never remove a referenced secret.
         try {
@@ -173,8 +180,6 @@ export class MessagingInstallations implements MessagingInstallationStore {
         }
         throw error;
       }
-      if (previousCiphertext && previousCiphertext !== sealed.ciphertext)
-        await this.cleanupCredential(previousCiphertext, id);
     });
   }
 
@@ -254,6 +259,7 @@ export class MessagingInstallations implements MessagingInstallationStore {
     ciphertext: string;
   }) {
     const removed = await this.prisma.$transaction(async (tx) => {
+      const retiring = await this.captureRetirement(tx, installation.id);
       await tx.messagingIdentity.deleteMany({
         where: {
           spaceId: installation.spaceId,
@@ -270,9 +276,10 @@ export class MessagingInstallations implements MessagingInstallationStore {
         },
       });
       if (result.count !== 1) throw new Error("Workspace connection changed; try again");
+      await this.retirement?.enqueue(tx, retiring);
       return true;
     });
-    if (removed) await this.cleanupCredential(installation.ciphertext, installation.id);
+    if (!removed) return;
   }
 
   async isActive(id: string): Promise<boolean> {
@@ -308,17 +315,23 @@ export class MessagingInstallations implements MessagingInstallationStore {
       return { ...installation, credential: await this.secrets.load(ciphertext, row.id) };
     });
   }
+  private async captureRetirement(
+    tx: Pick<PrismaClient, "$queryRaw">,
+    installationId: string,
+  ): Promise<string> {
+    if (!this.retirement) throw new Error("credential retirement is not configured");
+    return this.retirement.capture(tx, installationId);
+  }
+
   private async cleanupCredential(ref: string, installationId: string): Promise<void> {
     try {
       await this.secrets.delete(ref, installationId);
     } catch {
-      getLogger().warn("messaging credential cleanup failed; queuing retry");
-      try {
-        if (!this.retireCredential) throw new Error("credential cleanup is not configured");
-        await this.retireCredential({ installationId, ref });
-      } catch {
-        getLogger().warn("messaging credential cleanup retry could not be queued");
-      }
+      // This reference was never committed on an installation row, so there is no
+      // retirement record to retry. Do not queue the reference itself.
+      getLogger().warn("uncommitted messaging credential could not be deleted", {
+        installationId,
+      });
     }
   }
 

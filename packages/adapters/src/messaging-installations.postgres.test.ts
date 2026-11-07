@@ -4,6 +4,7 @@ import type { PrismaClient } from "@rakazo/db";
 import {
   asSystem,
   createDb,
+  installQueueBoundary,
   provisionMessagingIdentity,
   runAsSystem,
   runAsTenant,
@@ -11,6 +12,7 @@ import {
   teamChatRunFromOwner,
 } from "@rakazo/db";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { captureCredentialRetirement, enqueueCredentialRetirement } from "./credential-cleanup.js";
 import { MessagingInstallations } from "./messaging-installations.js";
 import { EncryptedSecretStore } from "./secrets.js";
 import { SlackInstallProvider } from "./slack-install-provider.js";
@@ -61,6 +63,7 @@ describePostgres("messaging workspace installation (PostgreSQL)", () => {
       });
       bots.push(ids.botId);
     }
+    await installQueueBoundary(process.env.DATABASE_URL!);
     manager = new MessagingInstallations(
       prisma,
       new EncryptedSecretStore("fake-test-encryption-key"),
@@ -73,6 +76,11 @@ describePostgres("messaging workspace installation (PostgreSQL)", () => {
         },
         fetcher,
       ),
+      undefined,
+      {
+        capture: (tx, installationId) => captureCredentialRetirement(tx, installationId),
+        enqueue: (tx, workItemId) => enqueueCredentialRetirement(tx, workItemId),
+      },
     );
   });
   afterAll(async () => {
