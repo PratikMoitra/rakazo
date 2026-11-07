@@ -275,28 +275,16 @@ describe("createBackgroundJobHandlers", () => {
   });
 });
 
-it("retries retired messaging credentials without deleting a currently referenced credential", async () => {
-  const remove = vi.fn(async () => undefined);
-  const findUnique = vi.fn(async () => ({ ciphertext: "active-ref" }));
+it("resolves credential cleanup from the work item id and hides resolver failures", async () => {
+  const cleanup = vi.fn(async () => undefined);
   const handlers = createBackgroundJobHandlers({
-    prisma: { messagingInstallation: { findUnique } },
-    secretStore: { delete: remove },
+    cleanupRetiredCredential: cleanup,
   } as unknown as Parameters<typeof createBackgroundJobHandlers>[0]);
-  await handlers["messaging.credential-cleanup"]({
-    installationId: "install-a",
-    ref: "active-ref",
-  });
-  expect(remove).not.toHaveBeenCalled();
-  await handlers["messaging.credential-cleanup"]({
-    installationId: "install-a",
-    ref: "retired-ref",
-  });
-  expect(remove).toHaveBeenCalledWith(
-    "retired-ref",
-    expect.objectContaining({ recordId: "install-a" }),
+  const workItemId = "5b0b5a6e-3e2a-4f5b-9c1d-6a7b8c9d0e1f";
+  await handlers["messaging.credential-cleanup"]({ workItemId });
+  expect(cleanup).toHaveBeenCalledWith(workItemId);
+  cleanup.mockRejectedValueOnce(new Error("secret store temporarily unavailable") as never);
+  await expect(handlers["messaging.credential-cleanup"]({ workItemId })).rejects.toThrow(
+    "credential_cleanup_failed",
   );
-  remove.mockRejectedValueOnce(new Error("secret store temporarily unavailable") as never);
-  await expect(
-    handlers["messaging.credential-cleanup"]({ installationId: "install-a", ref: "retired-ref" }),
-  ).rejects.toThrow("temporarily unavailable");
 });

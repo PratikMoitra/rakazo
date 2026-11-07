@@ -7,6 +7,7 @@ import { loadRootEnv } from "@rakazo/core/node/load-root-env";
 import {
   databaseUrls,
   deployMigrations,
+  installQueueBoundary,
   provisionRuntimeRole,
   RUNTIME_ROLE,
   SINGLE_DATABASE_URL_WARNING,
@@ -23,6 +24,7 @@ await deployMigrations({
   }).trim(),
 });
 await migrateJobQueue(urls.migrationUrl);
+await installQueueBoundary(urls.migrationUrl);
 
 if (!urls.separate) {
   process.stderr.write(`WARNING: ${SINGLE_DATABASE_URL_WARNING}\n`);

@@ -67,6 +67,7 @@ import {
   PipedreamConnector,
   PostgresRealtimeFanout,
   PrismaPushTokenStore,
+  performCredentialCleanup,
   pipedreamConfigFromEnv,
   RunJobPublisher,
   RunStarter,
@@ -91,6 +92,7 @@ import { resolveEncryptionKey, resolveSupervisorToken, uploadLimitFromEnv } from
 import {
   createBoardEvents,
   createDb,
+  createPool,
   createSecurityEventPruner,
   createThreadEvents,
   describeRowSecurity,
@@ -129,6 +131,10 @@ async function main() {
     keyProvider: contentKeyProviderFromEnv(),
   });
   const { pool } = created;
+  const workerDatabaseUrl = process.env.DATABASE_WORKER_URL?.trim();
+  const queuePool = workerDatabaseUrl
+    ? createPool(workerDatabaseUrl, { applicationName: "rakazo-worker-queue" })
+    : pool;
   let { prisma } = created;
   const rowSecurity = rowSecurityWarning(await describeRowSecurity(prisma));
   if (rowSecurity) logger.warn(rowSecurity);
@@ -243,7 +249,7 @@ async function main() {
   const inMemoryJobs = process.env.WAKEUP_DRIVER === "memory" ? new InMemoryJobQueue() : undefined;
   const runs = new RunStarter(realtime, { signal: shutdown.signal });
   const jobs: JobPublisher =
-    inMemoryJobs ?? new RunJobPublisher(prisma, new GraphileJobPublisher(pool, prisma), runs);
+    inMemoryJobs ?? new RunJobPublisher(prisma, new GraphileJobPublisher(queuePool, prisma), runs);
   const { messaging } = installedMessaging(
     prisma,
     secrets,
@@ -255,6 +261,9 @@ async function main() {
     },
     legacyMessaging,
     jobs,
+    async ({ installationId, ref }) => {
+      await prisma.$queryRaw`SELECT queue_api.create_credential_cleanup(${installationId}::text, ${ref}::text)`;
+    },
   );
   const ticketChanges = createTicketChangeNotifier({
     boardEvents,
@@ -350,7 +359,7 @@ async function main() {
     inMemoryJobs ??
     withRunWorker(
       new RunWorkerHost(prisma, realtime, runs, { pool }),
-      createReservedGraphileJobWorkerHost(pool, {
+      createReservedGraphileJobWorkerHost(queuePool, {
         concurrency: parsePositiveInteger(process.env.GRAPHILE_WORKER_CONCURRENCY, 4),
       }),
     );
@@ -376,6 +385,8 @@ async function main() {
     notifications,
     mediaGeneration,
     maxUploadSizeBytes,
+    cleanupRetiredCredential: (workItemId) =>
+      performCredentialCleanup({ pool: queuePool, prisma, secretStore: secrets }, workItemId),
   });
   const reconciler = createJobReconciler({
     prisma,
@@ -404,7 +415,7 @@ async function main() {
     reconcileAuditLog: createAuditLogReconciler(prisma, auditLogConfig()),
     reconcileHomeStorage: homeStorageSweeper(home),
     reconcileIdleComputers: createIdleComputerSweeper({ prisma, jobs }),
-    reconcileDeadJobs: inMemoryJobs ? undefined : createDeadJobPruner(pool),
+    reconcileDeadJobs: inMemoryJobs ? undefined : createDeadJobPruner(queuePool),
   });
   let stopHealth: (() => Promise<void>) | undefined;
   let stopping = false;
@@ -428,6 +439,7 @@ async function main() {
         await installedConnectors.close();
         await prisma.$disconnect().catch(() => undefined);
         await pool.end().catch(() => undefined);
+        if (queuePool !== pool) await queuePool.end().catch(() => undefined);
       } finally {
         await analytics?.flush();
         await shutdownPiTelemetry();

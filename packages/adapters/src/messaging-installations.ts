@@ -19,7 +19,11 @@ export class MessagingInstallations implements MessagingInstallationStore {
     private readonly prisma: PrismaClient,
     private readonly secrets: SecretStore,
     readonly provider: MessagingInstallProvider,
-    private readonly cleanupJobs?: Pick<JobPublisher, "enqueue">,
+    _cleanupJobs?: Pick<JobPublisher, "enqueue">,
+    private readonly retireCredential?: (input: {
+      installationId: string;
+      ref: string;
+    }) => Promise<void>,
   ) {}
 
   /** Without a chosen bot, the workspace answers as the user's first bot in the current space. */
@@ -310,12 +314,8 @@ export class MessagingInstallations implements MessagingInstallationStore {
     } catch {
       getLogger().warn("messaging credential cleanup failed; queuing retry");
       try {
-        await this.cleanupJobs?.enqueue({
-          name: "messaging.credential-cleanup",
-          payload: { installationId, ref },
-          replaceKey: `messaging.credential-cleanup:${credentialDigest(ref)}`,
-          maxAttempts: 20,
-        });
+        if (!this.retireCredential) throw new Error("credential cleanup is not configured");
+        await this.retireCredential({ installationId, ref });
       } catch {
         getLogger().warn("messaging credential cleanup retry could not be queued");
       }

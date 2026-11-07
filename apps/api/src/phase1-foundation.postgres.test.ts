@@ -11,6 +11,7 @@ import { requeueRunAfterShutdown } from "../../../packages/adapters/src/run-life
 import { attachWorkspaceFileToThread } from "../../../packages/adapters/src/thread-artifacts.js";
 import { createApp } from "./app.js";
 import { rpcRequestMaxBytes } from "./request-body-limit.js";
+import { setUploadPolicy } from "./upload-policy.js";
 
 const databaseUrl = process.env.VERIFY_DATABASE === "1" ? process.env.DATABASE_URL : undefined;
 const origin = "http://127.0.0.1:5173";
@@ -266,6 +267,60 @@ it.skipIf(!databaseUrl)(
       await system.user.update({ where: { email: adminEmail }, data: { emailVerified: false } });
       const unverified = await call(adminCookie, "uploadPolicy/set", { maxFileBytes: 1024 * 1024 });
       expect(unverified.status).toBe(403);
+      const ownerRow = await system.user.findUniqueOrThrow({
+        where: { email: ownerAddress },
+        select: { id: true },
+      });
+      const ownerSpace = await system.spaceMember.findFirstOrThrow({
+        where: { userId: ownerRow.id },
+        select: { spaceId: true },
+      });
+      const ownerActor = {
+        userId: ownerRow.id,
+        spaceId: ownerSpace.spaceId,
+        email: ownerAddress,
+        isDeploymentOwner: false,
+      };
+      await expect(
+        setUploadPolicy(
+          {
+            prisma: system,
+            env: {
+              adminEmails: [adminEmail],
+              uploadSizeExplicit: false,
+              maxUploadSizeBytes: limit,
+            },
+          },
+          ownerActor,
+          1024 * 1024,
+        ),
+      ).rejects.toMatchObject({ code: "FORBIDDEN" });
+      const unverifiedAdmin = await system.user.findUniqueOrThrow({
+        where: { email: adminEmail },
+        select: { id: true },
+      });
+      await expect(
+        setUploadPolicy(
+          {
+            prisma: system,
+            env: {
+              adminEmails: [adminEmail],
+              uploadSizeExplicit: false,
+              maxUploadSizeBytes: limit,
+            },
+          },
+          { ...ownerActor, userId: unverifiedAdmin.id, email: adminEmail },
+          1024 * 1024,
+        ),
+      ).rejects.toMatchObject({ code: "FORBIDDEN" });
+      expect(
+        (
+          await system.deploymentSettings.findUnique({
+            where: { id: "default" },
+            select: { maxUploadSizeBytes: true },
+          })
+        )?.maxUploadSizeBytes ?? null,
+      ).toBeNull();
       await system.user.update({ where: { email: adminEmail }, data: { emailVerified: true } });
       const changed = await call(adminCookie, "uploadPolicy/set", { maxFileBytes: 1024 * 1024 });
       expect(changed.status).toBe(200);
@@ -311,6 +366,35 @@ it.skipIf(!databaseUrl)(
       const lastBytes = (ordered.at(-1)?.metadata as { maxFileBytes?: number } | null)
         ?.maxFileBytes;
       expect(finalPolicy).toBe(lastBytes);
+      const raised = await call(adminCookie, "uploadPolicy/set", { maxFileBytes: 2 * 1024 * 1024 });
+      expect(raised.status).toBe(200);
+      const beforeSameTarget = await audits();
+      const [againA, againB] = await Promise.all([
+        call(adminCookie, "uploadPolicy/set", { maxFileBytes: 1024 * 1024 }),
+        call(adminCookie, "uploadPolicy/set", { maxFileBytes: 1024 * 1024 }),
+      ]);
+      expect([againA.status, againB.status].sort()).toEqual([200, 200]);
+      expect(await audits()).toBe(beforeSameTarget + 1);
+      const chain = await system.auditEvent.findMany({
+        where: { action: "upload.policy.changed", actorId: adminId },
+        select: { metadata: true },
+      });
+      const steps = chain
+        .map(
+          (row) =>
+            row.metadata as {
+              previousBytes?: number | null;
+              maxFileBytes?: number;
+              sequence?: number;
+            },
+        )
+        .sort((left, right) => (left.sequence ?? 0) - (right.sequence ?? 0));
+      expect(steps.every((step) => Number.isInteger(step.sequence))).toBe(true);
+      for (let index = 1; index < steps.length; index += 1) {
+        expect(steps[index]?.previousBytes).toBe(steps[index - 1]?.maxFileBytes);
+      }
+      expect(steps.at(-1)?.maxFileBytes).toBe(1024 * 1024);
+      const settledAudits = await audits();
       const botRow = await system.bot.findUniqueOrThrow({
         where: { id: botId },
         select: { spaceId: true },
@@ -373,10 +457,11 @@ it.skipIf(!databaseUrl)(
           })
         ).maxUploadSizeBytes,
       ).toBe(beforeFailure.maxUploadSizeBytes);
-      expect(await audits()).toBe(afterConflict);
+      expect(await audits()).toBe(settledAudits);
       await system.$executeRawUnsafe(
-        `DROP TRIGGER IF EXISTS phase1_fail_upload_audit ON audit_events; DROP FUNCTION IF EXISTS phase1_fail_upload_audit();`,
+        `DROP TRIGGER IF EXISTS phase1_fail_upload_audit ON audit_events`,
       );
+      await system.$executeRawUnsafe(`DROP FUNCTION IF EXISTS phase1_fail_upload_audit()`);
       const smallOver = await call(cookie, "artifacts/create", {
         botId,
         name: "small-over.txt",
@@ -418,7 +503,7 @@ it.skipIf(!databaseUrl)(
         });
         expect(refused.status).toBeGreaterThanOrEqual(400);
         expect(JSON.stringify(await refused.json())).toContain("upload_policy_locked");
-        expect(await audits()).toBe(afterConflict);
+        expect(await audits()).toBe(settledAudits);
       } finally {
         await locked.stop();
       }
@@ -428,6 +513,12 @@ it.skipIf(!databaseUrl)(
           where: { id: "default" },
           data: { maxUploadSizeBytes: null },
         })
+        .catch(() => undefined);
+      await system
+        .$executeRawUnsafe(`DROP TRIGGER IF EXISTS phase1_fail_upload_audit ON audit_events`)
+        .catch(() => undefined);
+      await system
+        .$executeRawUnsafe(`DROP FUNCTION IF EXISTS phase1_fail_upload_audit()`)
         .catch(() => undefined);
       await handles.stop();
       await rm(dataDir, { recursive: true, force: true });

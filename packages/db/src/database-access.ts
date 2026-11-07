@@ -207,14 +207,25 @@ export const JOB_QUEUE_POLICY = "rakazo_app_queue";
  * `_private_*` tables. Their owner (the migration role) bypasses that; the
  * runtime role would see no jobs and could not add any. The policy below is
  * queue access for that one role, not tenant isolation: `USING (true)` lets
- * the role read and change every job row. Payloads carry run, thread, user,
- * computer, routine, installation, and purchase ids, a push ticket id and token
- * digest, and `messaging.credential-cleanup` carries the secret-store ref.
- * API enqueue and worker dispatch share one database login, so a separate
- * worker role is not applied here. The policy is recreated on each run, for
+ * the role read and change every job row. Most publishers still put entity ids
+ * in those payloads. Credential cleanup no longer does: it uses queue_api and
+ * keeps the retired reference in queue_private. Revoking these runtime grants
+ * now would stop the previous release, and this release, from enqueueing the
+ * jobs that still use Graphile directly. The policy is recreated on each run, for
  * every table with RLS on, so tables a graphile-worker upgrade adds or rebuilds
  * are covered and a hand-made policy of the same name is replaced by this definition.
  */
+/** Re-apply the runtime queue grants. Disposable tests restore them after a revoke rehearsal. */
+export async function restoreRuntimeQueueGrants(migrationUrl: string): Promise<void> {
+  const owner = new Client({ connectionString: migrationUrl });
+  await owner.connect();
+  try {
+    await grantJobQueue(owner);
+  } finally {
+    await owner.end();
+  }
+}
+
 async function grantJobQueue(owner: Client): Promise<void> {
   await owner.query(`
     DO $$

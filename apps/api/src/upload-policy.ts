@@ -76,6 +76,12 @@ export async function setUploadPolicy(
       `;
       const previous = locked[0]?.maxUploadSizeBytes ?? null;
       if (previous === next.maxFileBytes) return { changed: false as const, previous };
+      const [counted] = await tx.$queryRaw<Array<{ next: number }>>`
+        SELECT coalesce(max((metadata->>'sequence')::int), 0) + 1 AS next
+        FROM audit_events
+        WHERE action = 'upload.policy.changed'
+      `;
+      const sequence = counted?.next ?? 1;
       const space = await tx.space.findUnique({
         where: { id: actor.spaceId },
         select: { organizationId: true, name: true },
@@ -96,7 +102,7 @@ export async function setUploadPolicy(
           targetType: "deployment",
           targetId: "default",
           outcome: "success",
-          metadata: { previousBytes: previous, maxFileBytes: next.maxFileBytes },
+          metadata: { previousBytes: previous, maxFileBytes: next.maxFileBytes, sequence },
         },
       });
       return { changed: true as const, previous };

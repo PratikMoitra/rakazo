@@ -321,6 +321,25 @@ export class GraphileJobWorkerHost implements JobWorkerHost {
         ]),
     );
     if (!this.options.workload) taskList[INTERACTIVE_RUN_TASK] = taskList["run.continue"]!;
+    if (this.options.workload !== "interactive" && this.options.workload !== "background") {
+      taskList["work.dispatch"] = async (payload: unknown) => {
+        const unpacked = unwrapJobPayload(payload);
+        const body = unpacked.payload;
+        const workItemId =
+          body && typeof body === "object" && "workItemId" in body ? body.workItemId : undefined;
+        const extra =
+          body && typeof body === "object"
+            ? Object.keys(body).filter((key) => key !== "workItemId")
+            : ["invalid"];
+        if (typeof workItemId !== "string" || extra.length > 0) throw new Error("work_rejected");
+        try {
+          await dispatchJob(handlers, "messaging.credential-cleanup", { workItemId });
+        } catch (error) {
+          if (error instanceof Error && error.message === "work_rejected") throw error;
+          throw new Error("credential_cleanup_failed");
+        }
+      };
+    }
     const runner = await run({
       pgPool: this.pgPool,
       concurrency: this.options.concurrency ?? 4,
