@@ -2,11 +2,12 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { EmailEmulator } from "@rakazo/adapters";
+import { EmailEmulator, LocalArtifactStore } from "@rakazo/adapters";
 import { DEFAULT_UPLOAD_MAX_BYTES } from "@rakazo/contracts";
 import { asSystem } from "@rakazo/db";
 import { expect, it } from "vitest";
 import { requeueRunAfterShutdown } from "../../../packages/adapters/src/run-lifecycle.js";
+import { attachWorkspaceFileToThread } from "../../../packages/adapters/src/thread-artifacts.js";
 import { createApp } from "./app.js";
 import { rpcRequestMaxBytes } from "./request-body-limit.js";
 
@@ -253,6 +254,32 @@ it.skipIf(!databaseUrl)(
           where: { action: "upload.policy.changed", actorId: ownerId },
         });
       expect(await audits()).toBe(1);
+      const botRow = await system.bot.findUniqueOrThrow({
+        where: { id: botId },
+        select: { spaceId: true },
+      });
+      const generated = new LocalArtifactStore(dataDir);
+      const beforeGenerated = await system.artifact.count();
+      await expect(
+        attachWorkspaceFileToThread(
+          {
+            prisma: system,
+            artifacts: generated,
+            maxUploadSizeBytes: limit,
+            uploadSizeExplicit: false,
+          },
+          {
+            spaceId: botRow.spaceId,
+            userId: ownerId,
+            botId,
+            runId: run!.id,
+            filePath: "notes/too-big.txt",
+            bytes: Buffer.alloc(2 * 1024 * 1024, 3),
+            operationId: "phase1-generated",
+          },
+        ),
+      ).rejects.toMatchObject({ code: "upload_too_large" });
+      expect(await system.artifact.count()).toBe(beforeGenerated);
       await system.member.updateMany({ where: { userId: ownerId }, data: { role: "member" } });
       const memberDenied = await call(cookie, "uploadPolicy/set", {
         maxFileBytes: 2 * 1024 * 1024,

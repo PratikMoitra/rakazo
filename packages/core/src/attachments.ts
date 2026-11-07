@@ -70,16 +70,11 @@ export function uploadLimitFromEnv(source: { MAX_UPLOAD_SIZE_MB?: string }): {
   const value = source.MAX_UPLOAD_SIZE_MB?.trim();
   if (!value) return { maxUploadSizeBytes: DEFAULT_UPLOAD_MAX_BYTES, explicit: false };
   const mb = Number(value);
-  // Leave room for base64 expansion and the JSON envelope in the HTTP body guard.
-  if (
-    !/^\d+$/.test(value) ||
-    !Number.isSafeInteger(mb) ||
-    mb <= 0 ||
-    mb > Math.floor(Number.MAX_SAFE_INTEGER / (2 * 1024 * 1024))
-  ) {
-    throw new Error(
-      "MAX_UPLOAD_SIZE_MB must be a positive integer number of MiB within the safe byte range",
-    );
+  // The variable is mebibytes, not bytes. This phase refuses anything above 25 MiB
+  // so a value of 26214400 cannot be read as 26214400 MiB.
+  const maxMib = DEFAULT_UPLOAD_MAX_BYTES / (1024 * 1024);
+  if (!/^\d+$/.test(value) || !Number.isSafeInteger(mb) || mb < 1 || mb > maxMib) {
+    throw new Error(`MAX_UPLOAD_SIZE_MB must be a whole number of MiB from 1 through ${maxMib}`);
   }
   return { maxUploadSizeBytes: mb * 1024 * 1024, explicit: true };
 }

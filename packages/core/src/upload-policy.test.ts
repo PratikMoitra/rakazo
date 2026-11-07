@@ -106,4 +106,41 @@ describe("proposeUploadPolicyChange", () => {
       }),
     ).toThrow(expect.objectContaining({ code: UPLOAD_POLICY_INVALID_CODE }));
   });
+
+  it("treats the stored value as bytes and refuses a mebibyte-sized reading of 26214400", () => {
+    const bytes = 26_214_400;
+    expect(bytes).toBe(25 * 1024 * 1024);
+    expect(
+      proposeUploadPolicyChange({
+        role: "owner",
+        envExplicit: false,
+        ceilingBytes: bytes,
+        maxFileBytes: bytes,
+      }).maxFileBytes,
+    ).toBe(bytes);
+    for (const maxFileBytes of [0, -1, 1.5, 1024, bytes + 1, bytes * 1024 * 1024]) {
+      expect(() =>
+        proposeUploadPolicyChange({
+          role: "owner",
+          envExplicit: false,
+          ceilingBytes: Number.MAX_SAFE_INTEGER,
+          maxFileBytes,
+        }),
+      ).toThrow(expect.objectContaining({ code: UPLOAD_POLICY_INVALID_CODE }));
+    }
+    expect(
+      effectiveUploadPolicy({
+        ceilingBytes: 10 * 1024 * 1024,
+        envExplicit: true,
+        persistedBytes: bytes,
+      }).maxFileBytes,
+    ).toBe(10 * 1024 * 1024);
+    expect(
+      effectiveUploadPolicy({
+        ceilingBytes: Number.MAX_SAFE_INTEGER,
+        envExplicit: false,
+        persistedBytes: bytes * 1024 * 1024,
+      }),
+    ).toMatchObject({ maxFileBytes: bytes, source: "default" });
+  });
 });

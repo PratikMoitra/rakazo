@@ -267,6 +267,28 @@ describe("sandbox supervisor HTTP boundary", () => {
     );
   });
 
+  it("accepts a 25 MiB supervisor file body and rejects one extra byte", async () => {
+    const headers = {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+    };
+    const post = (size: number) =>
+      supervisorApp.request("/computers/missing/files", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          path: "notes/sized.txt",
+          content: Buffer.alloc(size, 1).toString("base64"),
+        }),
+      });
+    const accepted = await post(26_214_400);
+    expect(accepted.status).not.toBe(413);
+    expect(JSON.stringify(await accepted.json())).not.toContain("upload_too_large");
+    const rejected = await post(26_214_401);
+    expect(rejected.status).toBe(400);
+    await expect(rejected.json()).resolves.toMatchObject({ code: "upload_too_large" });
+  }, 120_000);
+
   it("keeps the larger file-write allowance scoped to that exact POST route", () => {
     expect(supervisorRequestBodyLimit("POST", "/computers/id/files")).toBe(
       MAX_SUPERVISOR_FILE_REQUEST_BYTES,

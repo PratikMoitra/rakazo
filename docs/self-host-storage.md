@@ -217,18 +217,22 @@ is no quarantine directory. Accepted files are stored under a generated id with
 owner-only permissions after the byte check. SVG is not an allowed attachment type.
 HTML previews may run script inside a sandbox that does not share the app origin and
 blocks outbound loads; that is not a malware scan.
-Set it in `.env` and restart the API, worker, and Docker supervisor (when used). An explicit
-`MAX_UPLOAD_SIZE_MB` is the effective limit and the allocation ceiling. While it is set, an
-owner or admin cannot store a different limit. When it is unset, an owner or admin may store
-a whole number of MiB from 1 through 25. That stored value is the effective limit, and it
-cannot exceed the process ceiling, so it cannot grow the HTTP buffer. Web, desktop, and mobile
-read `me.maxUploadSizeBytes`, which is that one effective value. `me.uploadPolicy` repeats it
+Set it in `.env` and restart the API, worker, and Docker supervisor (when used). The variable
+is a count of mebibytes, from 1 through 25. The byte ceiling is 26,214,400. A setting of
+26214400 is rejected, because that would be 26214400 MiB rather than 26,214,400 bytes.
+An explicit value is the effective limit and the HTTP allocation ceiling. While it is set, an
+owner or admin cannot store a different limit, and a stored value cannot raise it. When it is
+unset, an owner or admin may store 1,048,576 through 26,214,400 bytes in steps of 1 MiB.
+Zero, negative, fractional, and larger values are rejected. Web, desktop, and mobile read
+`me.maxUploadSizeBytes`, which is that one effective byte count. `me.uploadPolicy` repeats it
 with `source` of `env`, `persisted`, or `default`. If a reverse proxy limits request bodies, allow
 room for base64 encoding (about 4/3 of the file size) and the JSON envelope.
 
-Chat attachment upload and the Docker supervisor file HTTP route follow this ceiling. The host
-computer channel does not: its message cap stays 12 MiB and its file cap stays 8 MiB. A 25 MiB
-chat file is not transferred through that socket.
+Chat attachment upload, inbound mail attachments, account import, and files a run saves from
+its computer all use the effective byte limit, including a stored limit that is lower than the
+process ceiling. The Docker supervisor file HTTP route enforces the process ceiling, at most
+26,214,400 bytes, and does not read the stored limit: it has no database. The host computer
+channel does not carry a 25 MiB file: its message cap stays 12 MiB and its file cap stays 8 MiB.
 
 `MAX_ATTACHMENTS_PER_MESSAGE` sets the chat attachment count per message. It defaults
 to `4` and accepts integers from `1` to `100`. Set it in `.env` and restart the API.

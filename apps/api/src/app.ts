@@ -213,6 +213,7 @@ import {
   TEAM_CHAT_STARTUP_SHUTDOWN_MS,
   TeamChatStartupRetries,
 } from "./team-chat-startup.js";
+import { currentUploadPolicy } from "./upload-policy.js";
 import { endUserDeviceSession, mountUserDeviceRoutes } from "./user-devices.js";
 import { mountVoiceHttpRoutes, transcribeInboundVoice, voiceAccountErrorStatus } from "./voice.js";
 import { mountWebhookHttpRoutes } from "./webhook.js";
@@ -685,6 +686,7 @@ async function buildApp(overrides: CreateAppOverrides): Promise<AppHandles> {
   const executor = createRunExecutor({
     billingEnabled: modelCreditsEnabled,
     maxUploadSizeBytes: env.maxUploadSizeBytes,
+    uploadSizeExplicit: env.uploadSizeExplicit,
     mediaGeneration,
     contextStrategy,
     prisma,
@@ -1162,6 +1164,7 @@ async function buildApp(overrides: CreateAppOverrides): Promise<AppHandles> {
       dataDir: env.dataDir,
       messagingInstallations,
       maxArtifactBytes: env.maxUploadSizeBytes,
+      uploadSizeExplicit: env.uploadSizeExplicit,
     },
     sessionActor,
   );
@@ -1172,9 +1175,13 @@ async function buildApp(overrides: CreateAppOverrides): Promise<AppHandles> {
       events,
       jobs,
       ...env.inboundEmail,
-      storeAttachment: ({ spaceId, userId, ...input }) =>
+      storeAttachment: async ({ spaceId, userId, ...input }) =>
         storeInboundAttachment(
-          { prisma, artifacts, maxUploadSizeBytes: env.maxUploadSizeBytes },
+          {
+            prisma,
+            artifacts,
+            maxUploadSizeBytes: (await currentUploadPolicy({ prisma, env })).maxFileBytes,
+          },
           { spaceId, userId },
           input,
         ),
@@ -1213,9 +1220,13 @@ async function buildApp(overrides: CreateAppOverrides): Promise<AppHandles> {
         signupAllowlist: env.signupAllowlist,
       },
       acknowledge: receipts?.acknowledge,
-      storeAttachment: ({ spaceId, userId, ...input }) =>
+      storeAttachment: async ({ spaceId, userId, ...input }) =>
         storeInboundAttachment(
-          { prisma, artifacts, maxUploadSizeBytes: env.maxUploadSizeBytes },
+          {
+            prisma,
+            artifacts,
+            maxUploadSizeBytes: (await currentUploadPolicy({ prisma, env })).maxFileBytes,
+          },
           { spaceId, userId },
           input,
         ),
@@ -1353,9 +1364,13 @@ async function buildApp(overrides: CreateAppOverrides): Promise<AppHandles> {
         jobs,
         send: createMessagingTeamChatSender(messaging),
         fetchThreadHistory: createMessagingTeamChatHistory(messaging),
-        storeAttachment: ({ spaceId, userId, ...input }) =>
+        storeAttachment: async ({ spaceId, userId, ...input }) =>
           storeInboundAttachment(
-            { prisma, artifacts, maxUploadSizeBytes: env.maxUploadSizeBytes },
+            {
+              prisma,
+              artifacts,
+              maxUploadSizeBytes: (await currentUploadPolicy({ prisma, env })).maxFileBytes,
+            },
             { spaceId, userId },
             input,
           ),

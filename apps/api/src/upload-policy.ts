@@ -4,6 +4,7 @@ import type { Actor, UploadPolicy } from "@rakazo/contracts";
 import { ATTACHMENT_MAX_BYTES, UPLOAD_POLICY_FORBIDDEN_CODE } from "@rakazo/contracts";
 import {
   AttachmentValidationError,
+  boundedUploadCeiling,
   effectiveUploadPolicy,
   proposeUploadPolicyChange,
 } from "@rakazo/core";
@@ -26,13 +27,15 @@ export function uploadPolicyFor(
   persistedBytes: number | null | undefined,
 ): UploadPolicy {
   return effectiveUploadPolicy({
-    ceilingBytes: env.maxUploadSizeBytes ?? ATTACHMENT_MAX_BYTES,
+    ceilingBytes: boundedUploadCeiling(env.maxUploadSizeBytes ?? ATTACHMENT_MAX_BYTES),
     envExplicit: env.uploadSizeExplicit === true,
     persistedBytes,
   });
 }
 
 export async function currentUploadPolicy(deps: PolicyDeps): Promise<UploadPolicy> {
+  const find = deps.prisma.deploymentSettings?.findUnique;
+  if (typeof find !== "function") return uploadPolicyFor(deps.env, null);
   const row = await deps.prisma.deploymentSettings.findUnique({
     where: { id: "default" },
     select: { maxUploadSizeBytes: true },

@@ -1,5 +1,5 @@
+// Modified in the isolated phase-1 workspace slice (Apache-2.0; see LICENSE). Not an upstream Rakazo release.
 import type { MessageBlock } from "@rakazo/contracts";
-import { ATTACHMENT_MAX_BYTES } from "@rakazo/contracts";
 import { inferAttachmentMimeType, isBackgroundRunTrigger } from "@rakazo/core";
 import { resolveBotWorkspacePath } from "./computer-support.js";
 import { desktopGuardApplies, desktopProtectionGuardMessage } from "./desktop-command-guard.js";
@@ -10,7 +10,7 @@ import type { RunContext } from "./run-context.js";
 import { publishMessage } from "./run-messages.js";
 import type { ToolCall, ToolHandlers } from "./run-tool-gate.js";
 import { recordComputerAction } from "./run-tools-computer.js";
-import { attachWorkspaceFileToThread } from "./thread-artifacts.js";
+import { attachWorkspaceFileToThread, effectiveUploadBytes } from "./thread-artifacts.js";
 import { textContentArg } from "./tool-text.js";
 import type { RunWorkspace } from "./workspace-file-tools.js";
 import { listFilesFromTool, readFileFromTool, renderPlotFromTool } from "./workspace-file-tools.js";
@@ -166,7 +166,7 @@ export async function readWorkspaceFile(
       await ctx.computer.get("tool", call.name),
       resolveBotWorkspacePath(ctx.computer.mode, bot.id, filePath),
       context,
-      { maxBytes: deps.maxUploadSizeBytes ?? ATTACHMENT_MAX_BYTES },
+      { maxBytes: await effectiveUploadBytes(deps) },
     );
   } catch {
     return { error: "file not found or unreadable" };
@@ -190,7 +190,12 @@ export async function saveWorkspaceFile(
   const { deps, run } = ctx;
   if (!deps.artifacts) throw new Error("artifact storage unavailable");
   return attachWorkspaceFileToThread(
-    { prisma: deps.prisma, artifacts: deps.artifacts, maxUploadSizeBytes: deps.maxUploadSizeBytes },
+    {
+      prisma: deps.prisma,
+      artifacts: deps.artifacts,
+      maxUploadSizeBytes: deps.maxUploadSizeBytes,
+      uploadSizeExplicit: deps.uploadSizeExplicit,
+    },
     {
       spaceId: run.spaceId,
       userId: run.userId,

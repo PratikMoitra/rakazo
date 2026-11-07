@@ -47,7 +47,15 @@ describe("loadEnv", () => {
     expect(loadEnv({ ...base, MAX_UPLOAD_SIZE_MB: " 25 " }).maxUploadSizeBytes).toBe(26_214_400);
     expect(loadEnv(base).uploadSizeExplicit).toBe(false);
     expect(loadEnv({ ...base, MAX_UPLOAD_SIZE_MB: "10" }).uploadSizeExplicit).toBe(true);
+    expect(loadEnv(base).maxUploadSizeBytes).toBeLessThanOrEqual(26_214_400);
   });
+
+  it.each(["0", "-1", "1.5", "26", "26214400", "9007199254740991"])(
+    "rejects upload limit %s above 25 MiB or not a whole mebibyte count",
+    (value) => {
+      expect(() => loadEnv({ ...base, MAX_UPLOAD_SIZE_MB: value })).toThrow("MAX_UPLOAD_SIZE_MB");
+    },
+  );
 
   it.each(["0", "1e3", "9007199254740991"])("rejects invalid upload limit %s", (value) => {
     expect(() => loadEnv({ ...base, MAX_UPLOAD_SIZE_MB: value })).toThrow("MAX_UPLOAD_SIZE_MB");

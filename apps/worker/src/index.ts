@@ -1,3 +1,4 @@
+// Modified in the isolated phase-1 workspace slice (Apache-2.0; see LICENSE). Not an upstream Rakazo release.
 import { hostname } from "node:os";
 import { setTimeout as sleep } from "node:timers/promises";
 import type { JobPublisher, JobWorkerHost } from "@rakazo/adapter-kit";
@@ -86,7 +87,7 @@ import {
   withRunWorker,
   withSecretPersistence,
 } from "@rakazo/adapters";
-import { resolveEncryptionKey, resolveSupervisorToken, uploadSizeFromEnv } from "@rakazo/core";
+import { resolveEncryptionKey, resolveSupervisorToken, uploadLimitFromEnv } from "@rakazo/core";
 import {
   createBoardEvents,
   createDb,
@@ -266,7 +267,8 @@ async function main() {
   const paymentWallet = await createPaymentWalletProvider();
   // One instance: the executor submits videos and background polls finish them.
   const mediaGeneration = createMediaGenerationProvider();
-  const maxUploadSizeBytes = uploadSizeFromEnv(process.env);
+  const uploadLimit = uploadLimitFromEnv(process.env);
+  const maxUploadSizeBytes = uploadLimit.maxUploadSizeBytes;
   // Shared with the reconciler so a stuck wait uses the same push path as a finish notice.
   const pushTokens = new PrismaPushTokenStore(prisma, resolveEncryptionKey(process.env));
   const notifications = new ExpoPushProvider(pushTokens, {
@@ -284,6 +286,7 @@ async function main() {
   });
   const executor = createRunExecutor({
     maxUploadSizeBytes,
+    uploadSizeExplicit: uploadLimit.explicit,
     mediaGeneration,
     prisma,
     runtime,

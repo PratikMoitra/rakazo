@@ -1,3 +1,4 @@
+// Modified in the isolated phase-1 workspace slice (Apache-2.0; see LICENSE). Not an upstream Rakazo release.
 import { randomUUID } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
@@ -7,6 +8,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { serve } from "@hono/node-server";
 import {
+  AttachmentValidationError,
+  assertUploadByteLength,
   boundedSandboxCommandTimeoutMs,
   readBoundedJsonResponse,
   resolveSupervisorToken,
@@ -908,6 +911,16 @@ app.get("/computers/:id/files", async (c) => {
 
 app.post("/computers/:id/files", async (c) => {
   const body = supervisorFileWriteSchema().parse(await c.req.json());
+  let bytes: Buffer;
+  try {
+    bytes = Buffer.from(body.content, "base64");
+    assertUploadByteLength(bytes.byteLength, maxUploadSizeBytes);
+  } catch (error) {
+    if (error instanceof AttachmentValidationError && error.code === "upload_too_large") {
+      return c.json({ error: error.message, code: error.code }, 400);
+    }
+    throw error;
+  }
   try {
     const { container } = await managedContainer(
       c.req.param("id"),
@@ -915,12 +928,7 @@ app.post("/computers/:id/files", async (c) => {
       c.req.header("x-rakazo-space-id"),
     );
     const target = workspaceTarget(normalizeWorkspaceRelative(body.path));
-    await writeContainerFile(
-      container,
-      target,
-      Buffer.from(body.content, "base64"),
-      body.executable,
-    );
+    await writeContainerFile(container, target, bytes, body.executable);
     return c.json({ ok: true });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

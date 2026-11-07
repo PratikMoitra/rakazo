@@ -1,5 +1,6 @@
 // Phase-1 addition for the isolated workspace slice. Apache-2.0; see LICENSE. Not an upstream Rakazo file.
 import {
+  DEFAULT_UPLOAD_MAX_BYTES,
   UPLOAD_POLICY_FORBIDDEN_CODE,
   UPLOAD_POLICY_INVALID_CODE,
   UPLOAD_POLICY_LOCKED_CODE,
@@ -7,6 +8,13 @@ import {
 import { AttachmentValidationError } from "./attachments.js";
 
 const MIB = 1024 * 1024;
+
+/** This phase never allocates more than 25 MiB for one file, whatever the caller passes. */
+export function boundedUploadCeiling(bytes: number | undefined): number {
+  if (!Number.isSafeInteger(bytes) || bytes === undefined || bytes < 1)
+    return DEFAULT_UPLOAD_MAX_BYTES;
+  return Math.min(bytes, DEFAULT_UPLOAD_MAX_BYTES);
+}
 
 export type UploadPolicySource = "env" | "persisted" | "default";
 
@@ -23,7 +31,7 @@ export function effectiveUploadPolicy(input: {
   envExplicit: boolean;
   persistedBytes?: number | null;
 }): UploadPolicyView {
-  const ceiling = input.ceilingBytes;
+  const ceiling = boundedUploadCeiling(input.ceilingBytes);
   if (input.envExplicit) {
     return { maxFileBytes: ceiling, ceilingBytes: ceiling, source: "env", envLocked: true };
   }
@@ -58,7 +66,8 @@ export function proposeUploadPolicyChange(input: {
       UPLOAD_POLICY_LOCKED_CODE,
     );
   }
-  if (!isWholeMibWithin(input.maxFileBytes, input.ceilingBytes)) {
+  const ceiling = boundedUploadCeiling(input.ceilingBytes);
+  if (!isWholeMibWithin(input.maxFileBytes, ceiling)) {
     throw new AttachmentValidationError(
       "Upload policy must be a whole number of MiB within the server ceiling",
       UPLOAD_POLICY_INVALID_CODE,

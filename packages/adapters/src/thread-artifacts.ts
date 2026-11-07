@@ -14,6 +14,7 @@ import {
   ATTACHMENT_MAX_BYTES,
   ATTACHMENT_MAX_COUNT,
   attachmentSizeLabel,
+  DEFAULT_UPLOAD_MAX_BYTES,
   HISTORY_ATTACHMENTS_PER_RESPONSE,
   MCP_APP_MIME_TYPE,
   UPLOAD_TOO_LARGE_CODE,
@@ -21,6 +22,7 @@ import {
 import {
   AttachmentValidationError,
   attachmentComputerPath,
+  effectiveUploadPolicy,
   inferAttachmentMimeType,
   messageBlockForArtifact,
   validateAttachmentMimeType,
@@ -37,11 +39,39 @@ export type MaterializedThreadFile = {
   path: string;
 };
 
+export async function effectiveUploadBytes(deps: {
+  prisma: PrismaClient;
+  maxUploadSizeBytes?: number;
+  uploadSizeExplicit?: boolean;
+}): Promise<number> {
+  const ceiling = Math.min(
+    deps.maxUploadSizeBytes ?? ATTACHMENT_MAX_BYTES,
+    DEFAULT_UPLOAD_MAX_BYTES,
+  );
+  const find = (
+    deps.prisma as { deploymentSettings?: { findUnique?: (args: unknown) => Promise<unknown> } }
+  ).deploymentSettings?.findUnique;
+  let persisted: number | null = null;
+  if (typeof find === "function") {
+    const row = (await find({
+      where: { id: "default" },
+      select: { maxUploadSizeBytes: true },
+    })) as { maxUploadSizeBytes?: number | null } | null;
+    persisted = row?.maxUploadSizeBytes ?? null;
+  }
+  return effectiveUploadPolicy({
+    ceilingBytes: ceiling,
+    envExplicit: deps.uploadSizeExplicit === true,
+    persistedBytes: persisted,
+  }).maxFileBytes;
+}
+
 export async function attachWorkspaceFileToThread(
   deps: {
     prisma: PrismaClient;
     artifacts: ArtifactStore;
     maxUploadSizeBytes?: number;
+    uploadSizeExplicit?: boolean;
   },
   input: {
     spaceId: string;
@@ -65,9 +95,10 @@ export async function attachWorkspaceFileToThread(
   }
   const name = (input.name?.trim() || fileName).slice(0, ARTIFACT_NAME_MAX_LENGTH);
   validateAttachmentMimeType(mimeType);
-  if (input.bytes.byteLength > (deps.maxUploadSizeBytes ?? ATTACHMENT_MAX_BYTES)) {
+  const maxUploadSizeBytes = await effectiveUploadBytes(deps);
+  if (input.bytes.byteLength > maxUploadSizeBytes) {
     throw new AttachmentValidationError(
-      `file exceeds the ${attachmentSizeLabel(deps.maxUploadSizeBytes ?? ATTACHMENT_MAX_BYTES)} attachment limit`,
+      `file exceeds the ${attachmentSizeLabel(maxUploadSizeBytes)} attachment limit`,
       UPLOAD_TOO_LARGE_CODE,
     );
   }
