@@ -2023,7 +2023,7 @@ export type ServerUpdateRequest = z.infer<typeof ServerUpdateRequestSchema>;
 export const UploadPolicySchema = z.object({
   maxFileBytes: z.number().int().positive(),
   ceilingBytes: z.number().int().positive(),
-  source: z.enum(["env", "persisted", "default"]),
+  source: z.enum(["env", "persisted", "default", "invalid"]),
   envLocked: z.boolean(),
 });
 export type UploadPolicy = z.infer<typeof UploadPolicySchema>;

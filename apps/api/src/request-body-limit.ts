@@ -82,7 +82,11 @@ async function limitRequestBody(
   return undefined;
 }
 
-/** Allow base64 expansion plus room for the RPC JSON envelope. */
+/**
+ * Base64 expansion plus 1 MiB of RPC JSON. For a 25 MiB file this is 36,001,112 bytes.
+ * The limiter keeps that body, and the parser and decoder keep further copies.
+ * This is not a 25 MiB memory cap.
+ */
 export function rpcRequestMaxBytes(maxUploadSizeBytes = DEFAULT_UPLOAD_MAX_BYTES): number {
   return Math.max(MAX_RPC_REQUEST_BYTES, Math.ceil(maxUploadSizeBytes / 3) * 4 + 1024 * 1024);
 }

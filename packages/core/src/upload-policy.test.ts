@@ -1,7 +1,6 @@
 // Phase-1 addition for the isolated workspace slice. Apache-2.0; see LICENSE. Not an upstream Rakazo file.
 import {
   DEFAULT_UPLOAD_MAX_BYTES,
-  UPLOAD_POLICY_FORBIDDEN_CODE,
   UPLOAD_POLICY_INVALID_CODE,
   UPLOAD_POLICY_LOCKED_CODE,
 } from "@rakazo/contracts";
@@ -47,16 +46,15 @@ describe("effectiveUploadPolicy", () => {
         ceilingBytes: DEFAULT_UPLOAD_MAX_BYTES,
         envExplicit: false,
         persistedBytes: DEFAULT_UPLOAD_MAX_BYTES + MIB,
-      }).source,
-    ).toBe("default");
+      }),
+    ).toMatchObject({ source: "invalid", maxFileBytes: 1 });
   });
 });
 
 describe("proposeUploadPolicyChange", () => {
-  it("allows an owner or admin to store a whole MiB at the ceiling", () => {
+  it("accepts a whole mebibyte at the byte ceiling and ignores organization role", () => {
     expect(
       proposeUploadPolicyChange({
-        role: "owner",
         envExplicit: false,
         ceilingBytes: DEFAULT_UPLOAD_MAX_BYTES,
         maxFileBytes: DEFAULT_UPLOAD_MAX_BYTES,
@@ -64,7 +62,6 @@ describe("proposeUploadPolicyChange", () => {
     ).toEqual({ maxFileBytes: DEFAULT_UPLOAD_MAX_BYTES });
     expect(
       proposeUploadPolicyChange({
-        role: "member, admin",
         envExplicit: false,
         ceilingBytes: DEFAULT_UPLOAD_MAX_BYTES,
         maxFileBytes: MIB,
@@ -72,18 +69,9 @@ describe("proposeUploadPolicyChange", () => {
     ).toBe(MIB);
   });
 
-  it("denies other roles, an env lock, and a value above the ceiling", () => {
+  it("rejects an env lock and a value above the ceiling", () => {
     expect(() =>
       proposeUploadPolicyChange({
-        role: "member",
-        envExplicit: false,
-        ceilingBytes: DEFAULT_UPLOAD_MAX_BYTES,
-        maxFileBytes: MIB,
-      }),
-    ).toThrow(expect.objectContaining({ code: UPLOAD_POLICY_FORBIDDEN_CODE }));
-    expect(() =>
-      proposeUploadPolicyChange({
-        role: "owner",
         envExplicit: true,
         ceilingBytes: 10 * MIB,
         maxFileBytes: MIB,
@@ -91,7 +79,6 @@ describe("proposeUploadPolicyChange", () => {
     ).toThrow(expect.objectContaining({ code: UPLOAD_POLICY_LOCKED_CODE }));
     expect(() =>
       proposeUploadPolicyChange({
-        role: "owner",
         envExplicit: false,
         ceilingBytes: DEFAULT_UPLOAD_MAX_BYTES,
         maxFileBytes: DEFAULT_UPLOAD_MAX_BYTES + 1,
@@ -99,7 +86,6 @@ describe("proposeUploadPolicyChange", () => {
     ).toThrow(AttachmentValidationError);
     expect(() =>
       proposeUploadPolicyChange({
-        role: "owner",
         envExplicit: false,
         ceilingBytes: DEFAULT_UPLOAD_MAX_BYTES,
         maxFileBytes: DEFAULT_UPLOAD_MAX_BYTES + 1,
@@ -112,7 +98,6 @@ describe("proposeUploadPolicyChange", () => {
     expect(bytes).toBe(25 * 1024 * 1024);
     expect(
       proposeUploadPolicyChange({
-        role: "owner",
         envExplicit: false,
         ceilingBytes: bytes,
         maxFileBytes: bytes,
@@ -121,7 +106,6 @@ describe("proposeUploadPolicyChange", () => {
     for (const maxFileBytes of [0, -1, 1.5, 1024, bytes + 1, bytes * 1024 * 1024]) {
       expect(() =>
         proposeUploadPolicyChange({
-          role: "owner",
           envExplicit: false,
           ceilingBytes: Number.MAX_SAFE_INTEGER,
           maxFileBytes,
@@ -141,6 +125,6 @@ describe("proposeUploadPolicyChange", () => {
         envExplicit: false,
         persistedBytes: bytes * 1024 * 1024,
       }),
-    ).toMatchObject({ maxFileBytes: bytes, source: "default" });
+    ).toMatchObject({ maxFileBytes: 1, source: "invalid" });
   });
 });

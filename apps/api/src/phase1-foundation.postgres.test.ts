@@ -1,4 +1,5 @@
 // Phase-1 addition for the isolated workspace slice. Apache-2.0; see LICENSE. Not an upstream Rakazo file.
+// These calls use Hono app.request. They are in-process application requests, not a listening socket.
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,6 +24,7 @@ it.skipIf(!databaseUrl)(
     process.env.SCREEN_PROXY_SECRET ??= "phase1-screen-proxy-secret-32chars";
     process.env.SANDBOX_SUPERVISOR_TOKEN ??= "phase1-supervisor-token-32chars-xx";
     delete process.env.MAX_UPLOAD_SIZE_MB;
+    const adminEmail = `phase1-deploy-admin-${Date.now()}@example.test`;
     const dataDir = await mkdtemp(join(tmpdir(), "rakazo-phase1-"));
     const email = new EmailEmulator();
     const handles = await createApp({
@@ -38,6 +40,7 @@ it.skipIf(!databaseUrl)(
       email,
       uploadSizeExplicit: false,
       maxUploadSizeBytes: limit,
+      adminEmails: [adminEmail],
     });
     const system = asSystem(handles.prisma);
     const call = (cookie: string, procedure: string, json: unknown = {}) =>
@@ -239,7 +242,32 @@ it.skipIf(!databaseUrl)(
         ),
       ).toBe(false);
 
-      const changed = await call(cookie, "uploadPolicy/set", { maxFileBytes: 1024 * 1024 });
+      const ownerDenied = await call(cookie, "uploadPolicy/set", { maxFileBytes: 1024 * 1024 });
+      expect(ownerDenied.status).toBe(403);
+      const otherDenied = await call(otherCookie, "uploadPolicy/set", {
+        maxFileBytes: 1024 * 1024,
+      });
+      expect(otherDenied.status).toBe(403);
+      const adminSignup = await handles.app.request("/api/auth/sign-up/email", {
+        method: "POST",
+        headers: { "content-type": "application/json", origin },
+        body: JSON.stringify({
+          email: adminEmail,
+          password: "test-password-123",
+          name: "Deploy Admin",
+        }),
+      });
+      expect(adminSignup.status).toBeLessThan(400);
+      const adminCookie =
+        adminSignup.headers
+          .getSetCookie?.()
+          .map((value) => value.split(";")[0])
+          .join("; ") ?? "";
+      await system.user.update({ where: { email: adminEmail }, data: { emailVerified: false } });
+      const unverified = await call(adminCookie, "uploadPolicy/set", { maxFileBytes: 1024 * 1024 });
+      expect(unverified.status).toBe(403);
+      await system.user.update({ where: { email: adminEmail }, data: { emailVerified: true } });
+      const changed = await call(adminCookie, "uploadPolicy/set", { maxFileBytes: 1024 * 1024 });
       expect(changed.status).toBe(200);
       expect(
         ((await changed.json()) as { json: { source: string; maxFileBytes: number } }).json,
@@ -249,11 +277,40 @@ it.skipIf(!databaseUrl)(
       });
       const ownerId = ((await jsonOf(await call(cookie, "me"))) as { json: { userId: string } })
         .json.userId;
+      const adminId = (
+        (await jsonOf(await call(adminCookie, "me"))) as { json: { userId: string } }
+      ).json.userId;
       const audits = async () =>
         system.auditEvent.count({
-          where: { action: "upload.policy.changed", actorId: ownerId },
+          where: { action: "upload.policy.changed", actorId: adminId },
         });
       expect(await audits()).toBe(1);
+      const [sameA, sameB] = await Promise.all([
+        call(adminCookie, "uploadPolicy/set", { maxFileBytes: 1024 * 1024 }),
+        call(adminCookie, "uploadPolicy/set", { maxFileBytes: 1024 * 1024 }),
+      ]);
+      expect([sameA.status, sameB.status].sort()).toEqual([200, 200]);
+      expect(await audits()).toBe(1);
+      await Promise.all([
+        call(adminCookie, "uploadPolicy/set", { maxFileBytes: 1024 * 1024 }),
+        call(adminCookie, "uploadPolicy/set", { maxFileBytes: 2 * 1024 * 1024 }),
+      ]);
+      const afterConflict = await audits();
+      expect(afterConflict).toBeGreaterThanOrEqual(2);
+      expect(afterConflict).toBeLessThanOrEqual(3);
+      const finalPolicy = (
+        (await jsonOf(await call(adminCookie, "uploadPolicy/get"))) as {
+          json: { maxFileBytes: number };
+        }
+      ).json.maxFileBytes;
+      const ordered = await system.auditEvent.findMany({
+        where: { action: "upload.policy.changed", actorId: adminId },
+        orderBy: { createdAt: "asc" },
+        select: { metadata: true },
+      });
+      const lastBytes = (ordered.at(-1)?.metadata as { maxFileBytes?: number } | null)
+        ?.maxFileBytes;
+      expect(finalPolicy).toBe(lastBytes);
       const botRow = await system.bot.findUniqueOrThrow({
         where: { id: botId },
         select: { spaceId: true },
@@ -274,27 +331,52 @@ it.skipIf(!databaseUrl)(
             botId,
             runId: run!.id,
             filePath: "notes/too-big.txt",
-            bytes: Buffer.alloc(2 * 1024 * 1024, 3),
+            bytes: Buffer.alloc(3 * 1024 * 1024, 3),
             operationId: "phase1-generated",
           },
         ),
       ).rejects.toMatchObject({ code: "upload_too_large" });
       expect(await system.artifact.count()).toBe(beforeGenerated);
-      await system.member.updateMany({ where: { userId: ownerId }, data: { role: "member" } });
-      const memberDenied = await call(cookie, "uploadPolicy/set", {
-        maxFileBytes: 2 * 1024 * 1024,
+      const beforeFailure = await system.deploymentSettings.findUniqueOrThrow({
+        where: { id: "default" },
+        select: { maxUploadSizeBytes: true },
       });
-      expect(memberDenied.status).toBe(403);
-      expect(JSON.stringify(await memberDenied.json())).toContain("upload_policy_forbidden");
-      expect(await audits()).toBe(1);
-      await system.member.updateMany({ where: { userId: ownerId }, data: { role: "admin" } });
+      await system.$executeRawUnsafe(`
+        CREATE OR REPLACE FUNCTION phase1_fail_upload_audit() RETURNS trigger
+        LANGUAGE plpgsql AS $fn$
+        BEGIN
+          IF NEW.action = 'upload.policy.changed' THEN
+            RAISE EXCEPTION 'phase1 audit failure';
+          END IF;
+          RETURN NEW;
+        END
+        $fn$
+      `);
+      await system.$executeRawUnsafe(
+        `DROP TRIGGER IF EXISTS phase1_fail_upload_audit ON audit_events`,
+      );
+      await system.$executeRawUnsafe(`
+        CREATE TRIGGER phase1_fail_upload_audit
+        BEFORE INSERT ON audit_events
+        FOR EACH ROW EXECUTE FUNCTION phase1_fail_upload_audit()
+      `);
+      const failedAudit = await call(adminCookie, "uploadPolicy/set", {
+        maxFileBytes:
+          beforeFailure.maxUploadSizeBytes === 1024 * 1024 ? 2 * 1024 * 1024 : 1024 * 1024,
+      });
+      expect(failedAudit.status).toBeGreaterThanOrEqual(500);
       expect(
-        (await call(cookie, "uploadPolicy/set", { maxFileBytes: 2 * 1024 * 1024 })).status,
-      ).toBe(200);
-      expect(
-        (await call(cookie, "uploadPolicy/set", { maxFileBytes: 2 * 1024 * 1024 })).status,
-      ).toBe(200);
-      expect(await audits()).toBe(2);
+        (
+          await system.deploymentSettings.findUniqueOrThrow({
+            where: { id: "default" },
+            select: { maxUploadSizeBytes: true },
+          })
+        ).maxUploadSizeBytes,
+      ).toBe(beforeFailure.maxUploadSizeBytes);
+      expect(await audits()).toBe(afterConflict);
+      await system.$executeRawUnsafe(
+        `DROP TRIGGER IF EXISTS phase1_fail_upload_audit ON audit_events; DROP FUNCTION IF EXISTS phase1_fail_upload_audit();`,
+      );
       const smallOver = await call(cookie, "artifacts/create", {
         botId,
         name: "small-over.txt",
@@ -314,6 +396,7 @@ it.skipIf(!databaseUrl)(
         authUrl: origin,
         uploadSizeExplicit: true,
         maxUploadSizeBytes: 10 * 1024 * 1024,
+        adminEmails: [adminEmail],
       });
       try {
         const lockedMe = (await jsonOf(
@@ -330,12 +413,12 @@ it.skipIf(!databaseUrl)(
         });
         const refused = await locked.app.request("/rpc/uploadPolicy/set", {
           method: "POST",
-          headers: { "content-type": "application/json", cookie, origin },
+          headers: { "content-type": "application/json", cookie: adminCookie, origin },
           body: JSON.stringify({ json: { maxFileBytes: 1024 * 1024 } }),
         });
         expect(refused.status).toBeGreaterThanOrEqual(400);
         expect(JSON.stringify(await refused.json())).toContain("upload_policy_locked");
-        expect(await audits()).toBe(2);
+        expect(await audits()).toBe(afterConflict);
       } finally {
         await locked.stop();
       }

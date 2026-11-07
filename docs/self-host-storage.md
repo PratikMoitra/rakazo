@@ -221,8 +221,9 @@ Set it in `.env` and restart the API, worker, and Docker supervisor (when used).
 is a count of mebibytes, from 1 through 25. The byte ceiling is 26,214,400. A setting of
 26214400 is rejected, because that would be 26214400 MiB rather than 26,214,400 bytes.
 An explicit value is the effective limit and the HTTP allocation ceiling. While it is set, an
-owner or admin cannot store a different limit, and a stored value cannot raise it. When it is
-unset, an owner or admin may store 1,048,576 through 26,214,400 bytes in steps of 1 MiB.
+a verified deployment admin cannot store a different limit, and a stored value cannot raise it.
+When it is unset, only a verified deployment admin may store 1,048,576 through 26,214,400 bytes
+in steps of 1 MiB. An organization owner or admin role is not enough.
 Zero, negative, fractional, and larger values are rejected. Web, desktop, and mobile read
 `me.maxUploadSizeBytes`, which is that one effective byte count. `me.uploadPolicy` repeats it
 with `source` of `env`, `persisted`, or `default`. If a reverse proxy limits request bodies, allow

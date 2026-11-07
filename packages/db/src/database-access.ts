@@ -205,11 +205,15 @@ export const JOB_QUEUE_POLICY = "rakazo_app_queue";
  *
  * graphile-worker enables row-level security with no policies on its
  * `_private_*` tables. Their owner (the migration role) bypasses that; the
- * runtime role would see no jobs and could not add any. Those rows are queue
- * metadata whose payloads carry ids only, not tenant content, so the runtime
- * role gets every row. The policy is recreated on each run, for every table with
- * RLS on, so tables a graphile-worker upgrade adds or rebuilds are covered and a
- * hand-made policy of the same name is replaced by this definition.
+ * runtime role would see no jobs and could not add any. The policy below is
+ * queue access for that one role, not tenant isolation: `USING (true)` lets
+ * the role read and change every job row. Payloads carry run, thread, user,
+ * computer, routine, installation, and purchase ids, a push ticket id and token
+ * digest, and `messaging.credential-cleanup` carries the secret-store ref.
+ * API enqueue and worker dispatch share one database login, so a separate
+ * worker role is not applied here. The policy is recreated on each run, for
+ * every table with RLS on, so tables a graphile-worker upgrade adds or rebuilds
+ * are covered and a hand-made policy of the same name is replaced by this definition.
  */
 async function grantJobQueue(owner: Client): Promise<void> {
   await owner.query(`

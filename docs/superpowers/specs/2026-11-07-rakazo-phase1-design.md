@@ -39,19 +39,19 @@ This is the isolated foundation slice of the approved Rakazo workspace design. I
 
 ## Upload policy precedence
 
-`MAX_UPLOAD_SIZE_MB` counts mebibytes, from 1 through 25. The byte ceiling is 26,214,400. The value 26214400 is rejected as an environment setting, because that would mean 26214400 MiB. An explicit setting is the effective limit and the HTTP allocation ceiling. Owner and admin changes are rejected while it is set, and a stored byte count cannot raise it. When it is unset, an organization owner or admin may store 1048576 through 26214400 bytes in steps of 1048576. Zero, negative, fractional, and larger values are rejected. `me.maxUploadSizeBytes` is that byte count.
+`MAX_UPLOAD_SIZE_MB` counts mebibytes, from 1 through 25. The byte ceiling is 26,214,400. The value 26214400 is rejected as an environment setting, because that would mean 26214400 MiB. An explicit setting is the effective limit and the HTTP allocation ceiling. A stored byte count cannot raise it. When it is unset, a verified deployment admin (the existing `requireAdmin` check, not an organization owner or admin role) may store 1048576 through 26214400 bytes in steps of 1048576. Zero, negative, fractional, and larger values are rejected. An invalid stored value fails closed to one byte and source `invalid`. `me.maxUploadSizeBytes` is that byte count. The RPC body ceiling for a 25 MiB file is 36,001,112 bytes, and the request limiter plus the parser and decoder each hold copies.
 
 The HTTP body buffer stays at the process ceiling until restart. The persisted value cannot raise it.
 
 ## File paths and the 12 MiB socket
 
-- Supported at the effective limit, including 25 MiB when that is the ceiling: chat `artifacts/create` over HTTP, and the Docker supervisor `POST /computers/:id/files` HTTP route, whose body allowance follows `MAX_UPLOAD_SIZE_MB`.
+- Supported at the effective limit, including 25 MiB when that is the ceiling: chat `artifacts/create` over HTTP, and the Docker supervisor `POST /computers/:id/files` HTTP route. Workspace transfer uses the process ceiling captured at supervisor startup. Publishing that file into a thread uses the stored policy. A `maxFileBytes` field on the supervisor request does not change either limit.
 - Unsupported at 25 MiB, and left unchanged: the host-computer channel. Its message cap is 12 MiB (`HOST_COMPUTER_MAX_BYTES`) and its file cap is 8 MiB (`HOST_COMPUTER_MAX_FILE_BYTES`). The user-device websocket uses that message cap plus a small margin. Those caps also bound commands, so this slice does not raise them.
 - There is no separate resumable chunk protocol. An unfinished HTTP body is rejected with `upload_incomplete` and is not stored.
 
 ## Schema
 
-`deployment_settings.maxUploadSizeBytes` is a nullable integer of bytes, added by `20261130130000_upload_policy`. That name sorts after `20261130120000`, the latest migration already in this tree. A name of `20261107` would sort before later migrations this tree already contains, so Prisma would not apply it on a database that has those. `20261201` was ahead of both the work date and that sequence and was renamed before review. Previous releases do not read the column. Leaving it after a code rollback is safe. Dropping it is safe only after this code is no longer running. The migration adds a column and does not rewrite or delete rows. It was applied only to a disposable local database.
+`deployment_settings.maxUploadSizeBytes` is a nullable integer of bytes, added by `20261130130000_upload_policy`. That name sorts after `20261130120000`, the latest migration already in this tree. A name of `20261107` would sort before later migrations this tree already contains, so Prisma would not apply it on a database that has those. `20261201` was ahead of both the work date and that sequence and was renamed before review. `20261130130100_upload_policy_check` adds a check: null, or a whole mebibyte from 1048576 through 26214400. It does not rewrite rows. Previous releases do not read the column. Leaving it after a code rollback is safe, and the check accepts the null those releases leave behind. Dropping it is safe only after this code is no longer running. Both migrations were applied only to a disposable local database.
 
 ## Mobile compatibility
 

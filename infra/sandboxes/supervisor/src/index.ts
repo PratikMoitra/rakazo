@@ -909,6 +909,8 @@ app.get("/computers/:id/files", async (c) => {
   }
 });
 
+// Workspace transfer uses the process ceiling captured at startup. It does not
+// read the stored publication policy and it ignores any limit supplied by the caller.
 app.post("/computers/:id/files", async (c) => {
   const body = supervisorFileWriteSchema().parse(await c.req.json());
   let bytes: Buffer;

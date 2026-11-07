@@ -1,7 +1,6 @@
 // Phase-1 addition for the isolated workspace slice. Apache-2.0; see LICENSE. Not an upstream Rakazo file.
-import { ORPCError } from "@orpc/server";
 import type { Actor, UploadPolicy } from "@rakazo/contracts";
-import { ATTACHMENT_MAX_BYTES, UPLOAD_POLICY_FORBIDDEN_CODE } from "@rakazo/contracts";
+import { ATTACHMENT_MAX_BYTES } from "@rakazo/contracts";
 import {
   AttachmentValidationError,
   boundedUploadCeiling,
@@ -9,17 +8,19 @@ import {
   proposeUploadPolicyChange,
 } from "@rakazo/core";
 import type { PrismaClient } from "@rakazo/db";
-import { recordAuditEvent, runAsSystem } from "@rakazo/db";
+import { runAsSystem } from "@rakazo/db";
+import { requireAdmin } from "./admins.js";
 import { orpcAttachmentError } from "./attachment-error.js";
 
 type PolicyDeps = {
-  prisma: Pick<PrismaClient, "deploymentSettings" | "member">;
+  prisma: PrismaClient;
   env: PolicyEnv;
 };
 
 type PolicyEnv = {
   maxUploadSizeBytes?: number;
   uploadSizeExplicit?: boolean;
+  adminEmails?: string[];
 };
 
 export function uploadPolicyFor(
@@ -48,46 +49,58 @@ export async function setUploadPolicy(
   actor: Actor,
   maxFileBytes: number,
 ): Promise<UploadPolicy> {
-  const member = await deps.prisma.member.findFirst({
-    where: {
-      userId: actor.userId,
-      organization: { spaces: { some: { id: actor.spaceId } } },
-    },
-    select: { role: true },
-  });
+  await requireAdmin(
+    { prisma: deps.prisma, env: { adminEmails: deps.env.adminEmails ?? [] } },
+    actor.userId,
+  );
   let next: { maxFileBytes: number };
   try {
     next = proposeUploadPolicyChange({
-      role: member?.role,
       envExplicit: deps.env.uploadSizeExplicit === true,
       ceilingBytes: uploadPolicyFor(deps.env, null).ceilingBytes,
       maxFileBytes,
     });
   } catch (error) {
-    if (error instanceof AttachmentValidationError && error.code === UPLOAD_POLICY_FORBIDDEN_CODE) {
-      throw new ORPCError("FORBIDDEN", { message: error.message, data: { code: error.code } });
-    }
     if (error instanceof AttachmentValidationError) throw orpcAttachmentError(error);
     throw error;
   }
-  const current = await deps.prisma.deploymentSettings.findUnique({
-    where: { id: "default" },
-    select: { maxUploadSizeBytes: true },
-  });
-  if (current?.maxUploadSizeBytes !== next.maxFileBytes) {
-    await runAsSystem("persist the upload policy", () =>
-      deps.prisma.deploymentSettings.update({
+  const committed = await runAsSystem("commit the upload policy and its audit event", () =>
+    deps.prisma.$transaction(async (tx) => {
+      await tx.deploymentSettings.upsert({
+        where: { id: "default" },
+        create: { id: "default" },
+        update: {},
+      });
+      const locked = await tx.$queryRaw<Array<{ maxUploadSizeBytes: number | null }>>`
+        SELECT "maxUploadSizeBytes" FROM "deployment_settings" WHERE id = 'default' FOR UPDATE
+      `;
+      const previous = locked[0]?.maxUploadSizeBytes ?? null;
+      if (previous === next.maxFileBytes) return { changed: false as const, previous };
+      const space = await tx.space.findUnique({
+        where: { id: actor.spaceId },
+        select: { organizationId: true, name: true },
+      });
+      if (!space) throw new Error("upload policy actor has no space");
+      await tx.deploymentSettings.update({
         where: { id: "default" },
         data: { maxUploadSizeBytes: next.maxFileBytes },
-      }),
-    );
-    await recordAuditEvent({
-      action: "upload.policy.changed",
-      actor: { type: "user", id: actor.userId },
-      spaceId: actor.spaceId,
-      target: { type: "deployment", id: "default" },
-      metadata: { maxFileBytes: next.maxFileBytes },
-    });
-  }
-  return uploadPolicyFor(deps.env, next.maxFileBytes);
+      });
+      await tx.auditEvent.create({
+        data: {
+          organizationId: space.organizationId,
+          spaceId: actor.spaceId,
+          spaceName: space.name,
+          actorType: "user",
+          actorId: actor.userId,
+          action: "upload.policy.changed",
+          targetType: "deployment",
+          targetId: "default",
+          outcome: "success",
+          metadata: { previousBytes: previous, maxFileBytes: next.maxFileBytes },
+        },
+      });
+      return { changed: true as const, previous };
+    }),
+  );
+  return uploadPolicyFor(deps.env, committed.changed ? next.maxFileBytes : committed.previous);
 }

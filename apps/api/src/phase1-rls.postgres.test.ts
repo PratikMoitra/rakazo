@@ -1,4 +1,5 @@
 // Phase-1 addition for the isolated workspace slice. Apache-2.0; see LICENSE. Not an upstream Rakazo file.
+import { execFile } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -139,6 +140,35 @@ it.skipIf(!enabled)(
         handles.prisma.artifact.findMany({ where: { id: artifact.id }, select: { id: true } }),
       );
       expect(hidden).toEqual([]);
+      const database = new URL(migrationUrl!).pathname.slice(1);
+      await psql(
+        migrationUrl!,
+        `
+        DO $$ BEGIN
+          IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'rakazo_phase1_foreign') THEN
+            CREATE ROLE rakazo_phase1_foreign LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE PASSWORD 'phase1-foreign-password';
+          END IF;
+        END $$;
+      `,
+      );
+      await psql(migrationUrl!, `GRANT CONNECT ON DATABASE ${database} TO rakazo_phase1_foreign`);
+      await psql(migrationUrl!, `GRANT USAGE ON SCHEMA graphile_worker TO rakazo_phase1_foreign`);
+      const foreignUrl = new URL(migrationUrl!);
+      foreignUrl.username = "rakazo_phase1_foreign";
+      foreignUrl.password = "phase1-foreign-password";
+      for (const statement of [
+        "SELECT id FROM graphile_worker._private_jobs",
+        "UPDATE graphile_worker._private_jobs SET attempts = attempts",
+        "DELETE FROM graphile_worker._private_jobs",
+        "INSERT INTO graphile_worker._private_jobs DEFAULT VALUES",
+      ]) {
+        await expect(psql(foreignUrl.toString(), statement)).rejects.toThrow(/permission denied/i);
+      }
+      const readable = await psql(
+        runtimeUrl.toString(),
+        "SELECT count(*)::int AS count FROM graphile_worker._private_jobs",
+      );
+      expect(readable).toContain("count");
       const queued = await runAsSystem("phase1 queue probe", () =>
         handles.prisma.$queryRawUnsafe<Array<{ ok: boolean }>>(
           `SELECT current_setting('row_security', true) = 'on' AS ok`,
@@ -152,3 +182,33 @@ it.skipIf(!enabled)(
   },
   120_000,
 );
+
+function psql(connectionString: string, sql: string) {
+  const url = new URL(connectionString);
+  return new Promise<string>((resolve, reject) => {
+    execFile(
+      "psql",
+      [
+        "-h",
+        url.hostname,
+        "-p",
+        url.port || "5432",
+        "-U",
+        decodeURIComponent(url.username),
+        "-d",
+        url.pathname.slice(1),
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-c",
+        sql,
+      ],
+      {
+        env: { ...process.env, PGPASSWORD: decodeURIComponent(url.password) },
+      },
+      (error, stdout, stderr) => {
+        if (error) reject(new Error(stderr || error.message));
+        else resolve(stdout);
+      },
+    );
+  });
+}

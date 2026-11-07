@@ -1,7 +1,6 @@
 // Phase-1 addition for the isolated workspace slice. Apache-2.0; see LICENSE. Not an upstream Rakazo file.
 import {
   DEFAULT_UPLOAD_MAX_BYTES,
-  UPLOAD_POLICY_FORBIDDEN_CODE,
   UPLOAD_POLICY_INVALID_CODE,
   UPLOAD_POLICY_LOCKED_CODE,
 } from "@rakazo/contracts";
@@ -16,7 +15,7 @@ export function boundedUploadCeiling(bytes: number | undefined): number {
   return Math.min(bytes, DEFAULT_UPLOAD_MAX_BYTES);
 }
 
-export type UploadPolicySource = "env" | "persisted" | "default";
+export type UploadPolicySource = "env" | "persisted" | "default" | "invalid";
 
 export type UploadPolicyView = {
   maxFileBytes: number;
@@ -36,6 +35,9 @@ export function effectiveUploadPolicy(input: {
     return { maxFileBytes: ceiling, ceilingBytes: ceiling, source: "env", envLocked: true };
   }
   const persisted = input.persistedBytes;
+  if (persisted != null && !isWholeMibWithin(persisted, ceiling)) {
+    return { maxFileBytes: 1, ceilingBytes: ceiling, source: "invalid", envLocked: false };
+  }
   if (isWholeMibWithin(persisted, ceiling)) {
     return {
       maxFileBytes: persisted,
@@ -47,19 +49,12 @@ export function effectiveUploadPolicy(input: {
   return { maxFileBytes: ceiling, ceilingBytes: ceiling, source: "default", envLocked: false };
 }
 
-/** Owner or admin may store a whole number of MiB that does not exceed the process ceiling. */
+/** Byte checks for a deployment setting. Organization role is not authority. */
 export function proposeUploadPolicyChange(input: {
-  role: string | null | undefined;
   envExplicit: boolean;
   ceilingBytes: number;
   maxFileBytes: number;
 }): { maxFileBytes: number } {
-  if (!uploadPolicyRoleAllowed(input.role)) {
-    throw new AttachmentValidationError(
-      "Only an owner or admin can change the upload policy",
-      UPLOAD_POLICY_FORBIDDEN_CODE,
-    );
-  }
   if (input.envExplicit) {
     throw new AttachmentValidationError(
       "The upload limit is set by the server configuration",
@@ -74,12 +69,6 @@ export function proposeUploadPolicyChange(input: {
     );
   }
   return { maxFileBytes: input.maxFileBytes };
-}
-
-export function uploadPolicyRoleAllowed(role: string | null | undefined): boolean {
-  if (!role) return false;
-  const parts = role.split(",").map((value) => value.trim());
-  return parts.includes("owner") || parts.includes("admin");
 }
 
 function isWholeMibWithin(value: number | null | undefined, ceiling: number): value is number {

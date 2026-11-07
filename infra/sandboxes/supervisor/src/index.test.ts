@@ -281,6 +281,27 @@ describe("sandbox supervisor HTTP boundary", () => {
           content: Buffer.alloc(size, 1).toString("base64"),
         }),
       });
+    const tenantOverride = await supervisorApp.request("/computers/missing/files", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        path: "notes/sized.txt",
+        content: Buffer.from("hi").toString("base64"),
+        maxFileBytes: 1,
+      }),
+    });
+    expect(JSON.stringify(await tenantOverride.json())).not.toContain("upload_too_large");
+    const raised = await supervisorApp.request("/computers/missing/files", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        path: "notes/sized.txt",
+        content: Buffer.alloc(26_214_401, 1).toString("base64"),
+        maxFileBytes: 99_999_999,
+      }),
+    });
+    expect(raised.status).toBe(400);
+    await expect(raised.json()).resolves.toMatchObject({ code: "upload_too_large" });
     const accepted = await post(26_214_400);
     expect(accepted.status).not.toBe(413);
     expect(JSON.stringify(await accepted.json())).not.toContain("upload_too_large");

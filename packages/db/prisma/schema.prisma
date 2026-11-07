@@ -733,8 +733,9 @@ model DeploymentSettings {
   computerProvider                String?
   /// That provider's encrypted connection settings, owned by the deployment rather than a user.
   computerProviderCipher          String?
-  /// Whole-MiB per-file limit chosen by an owner or admin. Null uses the process default.
+  /// Whole-MiB per-file limit chosen by a verified deployment admin. Null uses the process default.
   /// An explicit MAX_UPLOAD_SIZE_MB still wins, and this value cannot exceed that ceiling.
+  /// Organization owner or admin role does not authorize a change.
   maxUploadSizeBytes              Int?
   createdAt                       DateTime @default(now())
   updatedAt                       DateTime @updatedAt

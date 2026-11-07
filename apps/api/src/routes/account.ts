@@ -239,9 +239,14 @@ export function accountRoutes(ctx: RouterContext) {
       get: authed.uploadPolicy.get.handler(async () =>
         currentUploadPolicy({ prisma: deps.prisma, env: deps.env }),
       ),
-      set: authed.uploadPolicy.set.handler(async ({ context, input }) =>
-        setUploadPolicy({ prisma: deps.prisma, env: deps.env }, context.actor, input.maxFileBytes),
-      ),
+      set: authed.uploadPolicy.set.handler(async ({ context, input }) => {
+        await requireAdmin(deps, context.actor.userId);
+        return setUploadPolicy(
+          { prisma: deps.prisma, env: deps.env },
+          context.actor,
+          input.maxFileBytes,
+        );
+      }),
     },
     // Retain wire compatibility for older clients, but app accounts have no server authority.
     deployment: {
