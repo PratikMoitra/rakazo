@@ -12,7 +12,12 @@ import {
   registerFixtureAllocation,
   revokeFixtureAllocation,
 } from "./fixture-allocation.js";
-import { isNonconnectingGenerate } from "./fixture-command.js";
+import {
+  assertTypedSqlDisabled,
+  classifyFixtureCommand,
+  isNonconnectingGenerate,
+  TYPED_SQL_REFUSAL,
+} from "./fixture-command.js";
 import {
   canonicalEngineInput,
   ENDPOINT_REFUSAL,
@@ -55,7 +60,21 @@ it("recognizes only an unambiguous generate command", () => {
   ).toBe(false);
 
   expect(command(["generate"])).toBe(true);
-  expect(command(["generate", "--sql"])).toBe(true);
+  expect(command(["generate", "--watch"])).toBe(true);
+  expect(command(["generate", "--schema", "prisma/schema.prisma"])).toBe(true);
+  expect(command(["generate", "--schema=prisma/schema.prisma"])).toBe(true);
+  expect(command(["generate", "--sql"])).toBe(false);
+  expect(command(["generate", "--sql", "--watch"])).toBe(false);
+  expect(command(["generate", "--watch", "--sql"])).toBe(false);
+  expect(command(["generate", "--schema", "other.prisma", "--sql"])).toBe(false);
+  expect(command(["generate", "--schema=other.prisma", "--watch", "--sql"])).toBe(false);
+  expect(command(["generate", "--sql=true"])).toBe(false);
+  expect(command(["generate", "--sql=false"])).toBe(false);
+  expect(command(["generate", "--watch=true"])).toBe(false);
+  expect(command(["generate", "--not-a-flag"])).toBe(false);
+  expect(command(["--json", "generate", "--sql"])).toBe(false);
+  expect(command(["--telemetry-information", "info", "generate", "--sql"])).toBe(false);
+  expect(command(["--config=prisma.config.ts", "generate", "--sql"])).toBe(false);
   expect(command(["--json", "generate"])).toBe(true);
   expect(command(["--preview-feature", "generate"])).toBe(true);
   expect(command(["--config=prisma.config.ts", "generate"])).toBe(true);
@@ -103,6 +122,89 @@ it("refuses a string-flag value named generate before any engine", async () => {
     RAKAZO_CONFIG_ARGV: "--config=prisma.config.ts generate",
   });
   expect(generate.code).toBe(0);
+});
+
+it("disables TypedSQL before a stubbed introspection that the schema would allow", () => {
+  const poisoned = "postgres://ambient:ambient@203.0.113.10/preserved";
+  const context = { typedSqlEnabled: true, queries: ["SELECT 1"], url: poisoned };
+  const delegated: string[] = [];
+  const introspect = (url: string) => {
+    delegated.push(url);
+  };
+  expect(classifyFixtureCommand(["node", "prisma", "generate", "--sql"])).toBe("typed-sql");
+  expect(() => assertTypedSqlDisabled(["node", "prisma", "generate", "--watch", "--sql"])).toThrow(
+    TYPED_SQL_REFUSAL,
+  );
+  try {
+    assertTypedSqlDisabled(["node", "prisma", "generate", "--schema=other.prisma", "--sql"]);
+    if (context.typedSqlEnabled && context.queries.length > 0) introspect(context.url);
+  } catch (error) {
+    expect(error).toEqual(expect.objectContaining({ message: TYPED_SQL_REFUSAL }));
+  }
+  expect(delegated).toEqual([]);
+});
+
+it("rejects TypedSQL generate forms before an engine when no allocation exists", async () => {
+  const forms = [
+    "generate --sql",
+    "--json generate --sql",
+    "--telemetry-information info generate --sql",
+    "--config=prisma.config.ts generate --sql",
+    "generate --schema other.prisma --sql",
+    "generate --schema=other.prisma --watch --sql",
+    "generate --watch --sql",
+    "generate --sql=true",
+    "generate --generator client --sql",
+    "--preview-feature generate --no-hints --sql",
+    "generate --not-a-flag",
+  ];
+  for (const form of forms) {
+    const refused = await run({
+      PATH: process.env.PATH,
+      HOME: process.env.HOME,
+      RAKAZO_CONFIG_ARGV: form,
+      DATABASE_URL: "postgres://ambient:ambient@203.0.113.10/preserved",
+      DATABASE_MIGRATION_URL: "postgres://ambient:ambient@203.0.113.10/preserved",
+    });
+    expect(refused.code, form).toBe(1);
+    expect(refused.output, form).not.toContain("engine-url-match");
+    expect(refused.output, form).toMatch(
+      /TypedSQL generation is disabled|owned fixture allocation/,
+    );
+    if (form.includes("--sql")) expect(refused.output, form).toContain(TYPED_SQL_REFUSAL);
+  }
+
+  const root = mkdtempSync(path.join(tmpdir(), "phase1-typed-sql-"));
+  const data = path.join(root, "data");
+  mkdirSync(data);
+  const handle = registerFixtureAllocation({
+    host: "127.0.0.1",
+    port: 9,
+    database: "db",
+    users: ["fixture"],
+    dataDirectory: data,
+    root,
+  });
+  const release = publishFixtureHandle(handle);
+  try {
+    const owned = await run({
+      PATH: process.env.PATH,
+      HOME: process.env.HOME,
+      RAKAZO_DISPOSABLE_FIXTURE: "1",
+      RAKAZO_FIXTURE_HANDLE: handle.path,
+      RAKAZO_FIXTURE_TOKEN: handle.token,
+      RAKAZO_OWNED_FIXTURE_ID: handle.id,
+      RAKAZO_CONFIG_ARGV: "generate --schema=other.prisma --watch --sql",
+      DATABASE_MIGRATION_URL: "postgres://fixture:secret@127.0.0.1:9/db",
+    });
+    expect(owned.code).toBe(1);
+    expect(owned.output).toContain(TYPED_SQL_REFUSAL);
+    expect(owned.output).not.toContain("engine-url-match");
+  } finally {
+    release();
+    revokeFixtureAllocation(handle);
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 it("accepts the deployer's lock-timeout URL in the config that child would load", async () => {

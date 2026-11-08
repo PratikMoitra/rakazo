@@ -1,11 +1,16 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { defineConfig } from "prisma/config";
-import { canonicalMutatingDatasource, isNonconnectingGenerate } from "./src/fixture-command.ts";
+import {
+  assertTypedSqlDisabled,
+  canonicalMutatingDatasource,
+  isNonconnectingGenerate,
+} from "./src/fixture-command.ts";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-// Only Prisma's generate subcommand skips the allocation check. It does not open a database.
+// Plain generate does not open a database. TypedSQL generate does, and this fixture disables it.
 // Dotenv is not loaded, so a missing flag cannot select an ambient database URL.
+assertTypedSqlDisabled(process.argv);
 const generating = isNonconnectingGenerate(process.argv);
 const migrationUrl = generating
   ? process.env.DATABASE_MIGRATION_URL
