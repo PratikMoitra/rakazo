@@ -43,14 +43,59 @@ export function credentialWorkerTarget(
  * ALTER roles. Raw-ref legacy jobs are counted by countLegacyCredentialJobs and
  * are not deleted here.
  */
+export interface CredentialWorkerConnection {
+  connect(): Promise<unknown>;
+  query<T = Record<string, unknown>>(
+    sql: string,
+    params?: unknown[],
+  ): Promise<{ rows: T[]; rowCount?: number | null }>;
+  end(): Promise<void>;
+}
+
+/**
+ * Compares the worker URL's host, port, and database with the migration URL.
+ * It does not open a connection and does not copy migration authentication
+ * onto another host. A different host fails closed, including aliases that
+ * would require a network lookup to confirm.
+ */
+export function assertPinnedWorkerEndpoint(migrationUrl: string, workerUrl: string): void {
+  const migration = parsedEndpoint(migrationUrl);
+  const worker = parsedEndpoint(workerUrl);
+  if (!migration || !worker || migration !== worker) {
+    throw new Error("DATABASE_WORKER_URL is not the trusted migration endpoint");
+  }
+}
+
+/** Migration authentication is never aimed at the worker-configured host. */
+export function migrationAuthProbe(): null {
+  return null;
+}
+
+function parsedEndpoint(value: string): string | undefined {
+  try {
+    const url = new URL(value);
+    const database = decodeURIComponent(url.pathname.replace(/^\//, ""));
+    if (!url.hostname || !database) return undefined;
+    return `${url.hostname.toLowerCase()}:${url.port || "5432"}/${database}`;
+  } catch {
+    return undefined;
+  }
+}
+
+function openMigrationClient(connectionString: string): CredentialWorkerConnection {
+  return new Client({ connectionString });
+}
+
 export async function preflightCredentialWorker(
   migrationUrl: string,
   workerUrl: string,
+  open: (connectionString: string) => CredentialWorkerConnection = openMigrationClient,
 ): Promise<void> {
   const target = credentialWorkerTarget(migrationUrl, workerUrl);
   if (target.mode !== "on") return;
+  assertPinnedWorkerEndpoint(migrationUrl, workerUrl);
   const workerDatabase = databaseName(workerUrl);
-  const owner = new Client({ connectionString: migrationUrl });
+  const owner = open(migrationUrl);
   await owner.connect();
   try {
     const [here] = (
@@ -63,15 +108,6 @@ export async function preflightCredentialWorker(
     ).rows;
     if (!here || here.db !== workerDatabase) {
       throw new Error("DATABASE_WORKER_URL must use the same database as the migration");
-    }
-    const [localIdentity] = (
-      await owner.query<{ ident: string }>(
-        "SELECT system_identifier::text AS ident FROM pg_control_system()",
-      )
-    ).rows;
-    const endpoint = await probeWorkerEndpoint(migrationUrl, workerUrl);
-    if (!localIdentity || endpoint.ident !== localIdentity.ident || endpoint.db !== here.db) {
-      throw new Error("DATABASE_WORKER_URL is not the migration database");
     }
     const reserved = new Set([QUEUE_OWNER, "rakazo_app", here.session_user, here.owner_name]);
     if (reserved.has(target.login)) {
@@ -87,7 +123,11 @@ export async function preflightCredentialWorker(
         member_of_owner: boolean;
       }>(
         `SELECT r.rolsuper, r.rolbypassrls, r.rolcanlogin, r.rolcreatedb, r.rolcreaterole,
-           pg_has_role(r.rolname, $2, 'MEMBER') AS member_of_owner
+           CASE
+             WHEN EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $2)
+               THEN pg_has_role(r.rolname, $2, 'MEMBER')
+             ELSE false
+           END AS member_of_owner
          FROM pg_roles AS r WHERE r.rolname = $1`,
         [target.login, QUEUE_OWNER],
       )
@@ -256,8 +296,7 @@ export async function provisionCredentialWorker(
         queue_api.renew_credential_lease(uuid, uuid),
         queue_api.complete_credential_retirement(uuid, uuid),
         queue_api.redact_dispatch_errors(),
-        queue_api.purge_redacted_retirements(integer),
-        queue_api.purge_dummy_orphans()
+        queue_api.purge_redacted_retirements(integer)
       TO ${name}
     `);
     await owner.query(
@@ -274,12 +313,56 @@ export async function provisionCredentialWorker(
         queue_api.renew_credential_lease(uuid, uuid),
         queue_api.complete_credential_retirement(uuid, uuid),
         queue_api.redact_dispatch_errors(),
-        queue_api.purge_redacted_retirements(integer),
-        queue_api.purge_dummy_orphans()
+        queue_api.purge_redacted_retirements(integer)
       FROM PUBLIC, rakazo_app
     `);
+    await attestCredentialWorker(migrationUrl, workerUrl);
   } finally {
     await owner.end();
+  }
+}
+
+/** After bootstrap, the worker login itself must land on the pinned database. */
+export async function attestCredentialWorker(
+  migrationUrl: string,
+  workerUrl: string,
+): Promise<void> {
+  assertPinnedWorkerEndpoint(migrationUrl, workerUrl);
+  const admin = new Client({ connectionString: migrationUrl });
+  const worker = new Client({ connectionString: workerUrl, connectionTimeoutMillis: 3000 });
+  try {
+    await admin.connect();
+    await worker.connect();
+    const [trusted] = (
+      await admin.query<{ ident: string; db: string }>(
+        "SELECT system_identifier::text AS ident, current_database() AS db FROM pg_control_system()",
+      )
+    ).rows;
+    const [session] = (
+      await worker.query<{
+        ident: string;
+        db: string;
+        session_user: string;
+        current_user: string;
+      }>(
+        `SELECT system_identifier::text AS ident, current_database() AS db,
+                session_user, current_user
+         FROM pg_control_system()`,
+      )
+    ).rows;
+    if (
+      !trusted ||
+      !session ||
+      session.session_user !== MANAGED_CREDENTIAL_WORKER ||
+      session.current_user !== MANAGED_CREDENTIAL_WORKER ||
+      session.ident !== trusted.ident ||
+      session.db !== trusted.db
+    ) {
+      throw new Error("credential worker connection is not the trusted migration database");
+    }
+  } finally {
+    await admin.end().catch(() => undefined);
+    await worker.end().catch(() => undefined);
   }
 }
 
@@ -320,7 +403,6 @@ async function grantDefinerQueueAccess(owner: Client): Promise<void> {
     "complete_credential_retirement(uuid, uuid)",
     "redact_dispatch_errors()",
     "purge_redacted_retirements(integer)",
-    "purge_dummy_orphans()",
     "register_active_credential(text, text)",
     "record_orphan_credential(text, text, text)",
     "credential_fingerprint(text)",
@@ -348,41 +430,6 @@ async function grantQueuePolicy(owner: Client, policy: string, role: string): Pr
 
 function loginOf(url: string): string {
   return decodeURIComponent(new URL(url).username);
-}
-
-async function probeWorkerEndpoint(
-  migrationUrl: string,
-  workerUrl: string,
-): Promise<{ ident: string; db: string }> {
-  const worker = new URL(workerUrl);
-  const probe = new URL(migrationUrl);
-  probe.hostname = worker.hostname;
-  probe.port = worker.port;
-  probe.pathname = worker.pathname;
-  const client = new Client({
-    connectionString: probe.toString(),
-    connectionTimeoutMillis: 3000,
-  });
-  try {
-    await client.connect();
-    const [row] = (
-      await client.query<{ ident: string; db: string }>(
-        "SELECT system_identifier::text AS ident, current_database() AS db FROM pg_control_system()",
-      )
-    ).rows;
-    if (!row) throw new Error("DATABASE_WORKER_URL is not the migration database");
-    return row;
-  } catch (error) {
-    if (
-      error instanceof Error &&
-      error.message === "DATABASE_WORKER_URL is not the migration database"
-    ) {
-      throw error;
-    }
-    throw new Error("DATABASE_WORKER_URL is not the migration database");
-  } finally {
-    await client.end().catch(() => undefined);
-  }
 }
 
 function databaseName(url: string): string {
@@ -813,21 +860,7 @@ BEGIN
 END
 $fn$;
 
-CREATE OR REPLACE FUNCTION queue_api.purge_dummy_orphans()
-RETURNS integer
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = pg_catalog
-AS $fn$
-DECLARE
-  removed integer;
-BEGIN
-  DELETE FROM queue_private.credential_orphan
-  WHERE retain_until < clock_timestamp();
-  GET DIAGNOSTICS removed = ROW_COUNT;
-  RETURN removed;
-END
-$fn$;
+DROP FUNCTION IF EXISTS queue_api.purge_dummy_orphans();
 
 DROP FUNCTION IF EXISTS queue_api.register_active_credential(text);
 CREATE OR REPLACE FUNCTION queue_api.credential_fingerprint(p_object_key text)

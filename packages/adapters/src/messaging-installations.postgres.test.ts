@@ -22,8 +22,12 @@ import { MessagingInstallations } from "./messaging-installations.js";
 import { EncryptedSecretStore } from "./secrets.js";
 import { SlackInstallProvider } from "./slack-install-provider.js";
 
+// PHASE1_FIXTURE_CLUSTER is set only by a process that created a new PostgreSQL
+// cluster. VERIFY_DATABASE alone must not run this suite against a preserved database.
 const describePostgres =
-  process.env.VERIFY_DATABASE && process.env.DATABASE_URL ? describe.sequential : describe.skip;
+  process.env.PHASE1_FIXTURE_CLUSTER === "1" && process.env.DATABASE_URL
+    ? describe.sequential
+    : describe.skip;
 describePostgres("messaging workspace installation (PostgreSQL)", () => {
   let prisma: PrismaClient;
   let close: () => Promise<void>;
@@ -68,7 +72,7 @@ describePostgres("messaging workspace installation (PostgreSQL)", () => {
       });
       bots.push(ids.botId);
     }
-    await installQueueBoundary(process.env.DATABASE_URL!);
+    await installQueueBoundary(process.env.DATABASE_MIGRATION_URL || process.env.DATABASE_URL!);
     manager = new MessagingInstallations(
       prisma,
       new EncryptedSecretStore("fake-test-encryption-key"),

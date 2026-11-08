@@ -1,7 +1,9 @@
 // Modified in the isolated phase-1 workspace slice (Apache-2.0; see LICENSE). Not an upstream Rakazo release.
 import { hostname } from "node:os";
+import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import type { JobPublisher, JobWorkerHost } from "@rakazo/adapter-kit";
+import { pathToFileURL } from "node:url";
+import type { JobPublisher, JobWorkerHost, SecretStore } from "@rakazo/adapter-kit";
 import {
   ComposioConnector,
   IntegrationProviderSettings,
@@ -11,6 +13,7 @@ import { phoneCallSettings } from "@rakazo/core";
 import { loadRootEnv } from "@rakazo/core/node/load-root-env";
 import { stopOnShutdownSignals } from "@rakazo/core/node/shutdown-signals";
 import { startWorkerHealth, watchEventLoopStalls } from "./health.js";
+import { rejectPhase1FixtureFlags } from "./reject-phase1-fixtures.js";
 import { createWorkerSecretStore } from "./secret-store.js";
 
 loadRootEnv();
@@ -119,7 +122,8 @@ import { MarkdownMemoryStore } from "@rakazo/memory";
 
 const logger = await createRootLogger(SERVICE_NAMES.worker);
 
-async function main() {
+export async function startWorker(options?: { secretStore?: SecretStore }) {
+  rejectPhase1FixtureFlags(process.env);
   const stopStallWatch = watchEventLoopStalls();
   const databaseUrl = process.env.DATABASE_URL;
   if (!databaseUrl) throw new Error("DATABASE_URL is required");
@@ -157,7 +161,7 @@ async function main() {
     connectionString: process.env.REALTIME_DATABASE_URL ?? databaseUrl,
     publisher: pool,
   });
-  const secrets = await createWorkerSecretStore(process.env, realtime);
+  const secrets = options?.secretStore ?? (await createWorkerSecretStore(process.env, realtime));
   if (secrets.describe().capabilities.degraded)
     logger.warn("Secret storage degraded; encrypted credentials remain available");
   prisma = withSecretPersistence(prisma, secrets);
@@ -537,11 +541,17 @@ async function main() {
 // The worker only does cross-tenant work: job dispatch, reconcilers, leadership and
 // realtime, all keyed by ids rather than a signed-in user. This is its one
 // row-level security bypass; jobs re-enter it explicitly (see wakeup.ts).
-runAsSystem("worker process", main).catch(async (error) => {
-  process.stderr.write(`${error instanceof Error ? error.message : "worker startup failed"}\n`);
-  logger.error("worker startup failed", error);
-  await logger.flush({ timeoutMs: 2_000 });
-  // jobHost.start retries 53300 without bound above, so a saturated Postgres at
-  // that step does not reach here. Other startup failures still exit.
-  process.exit(1);
-});
+const invokedDirectly =
+  process.argv[1] !== undefined &&
+  import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
+
+if (invokedDirectly) {
+  runAsSystem("worker process", () => startWorker()).catch(async (error) => {
+    process.stderr.write(`${error instanceof Error ? error.message : "worker startup failed"}\n`);
+    logger.error("worker startup failed", error);
+    await logger.flush({ timeoutMs: 2_000 });
+    // jobHost.start retries 53300 without bound above, so a saturated Postgres at
+    // that step does not reach here. Other startup failures still exit.
+    process.exit(1);
+  });
+}
