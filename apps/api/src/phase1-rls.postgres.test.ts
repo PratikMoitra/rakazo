@@ -5,9 +5,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   acceptanceChannels,
+  allowFixtureIdentity,
   asSystem,
   assertRuntimeRowSecurity,
+  currentFixtureAllocation,
   describeRowSecurity,
+  explicitPgConfig,
+  fixtureConnectionPlan,
   provisionRuntimeRole,
   runAsSystem,
   runAsTenant,
@@ -190,26 +194,43 @@ it.skipIf(!channels)(
 );
 
 function psql(connectionString: string, sql: string) {
-  const url = new URL(connectionString);
+  const preview = explicitPgConfig(connectionString);
+  const allocation = currentFixtureAllocation();
+  if (
+    preview.host !== allocation.host ||
+    preview.port !== allocation.port ||
+    !preview.database ||
+    !allocation.databases.includes(preview.database) ||
+    !preview.user
+  ) {
+    throw new Error("database target is not an owned fixture allocation");
+  }
+  const handlePath = process.env.RAKAZO_FIXTURE_HANDLE;
+  const token = process.env.RAKAZO_FIXTURE_TOKEN;
+  const id = process.env.RAKAZO_OWNED_FIXTURE_ID;
+  if (!handlePath || !token || !id)
+    throw new Error("database target is not an owned fixture allocation");
+  allowFixtureIdentity({ path: handlePath, token, id }, { user: preview.user });
+  const plan = fixtureConnectionPlan(connectionString);
   return new Promise<string>((resolve, reject) => {
     execFile(
       "psql",
       [
         "-h",
-        url.hostname,
+        plan.host,
         "-p",
-        url.port || "5432",
+        String(plan.port),
         "-U",
-        decodeURIComponent(url.username),
+        plan.user,
         "-d",
-        url.pathname.slice(1),
+        plan.database,
         "-v",
         "ON_ERROR_STOP=1",
         "-c",
         sql,
       ],
       {
-        env: { ...process.env, PGPASSWORD: decodeURIComponent(url.password) },
+        env: { PATH: process.env.PATH ?? "", PGPASSWORD: plan.password },
       },
       (error, stdout, stderr) => {
         if (error) reject(new Error(stderr || error.message));

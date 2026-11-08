@@ -28,6 +28,7 @@ export * from "./deferred-migrations.js";
 export * from "./events.js";
 export * from "./expire-stuck-run.js";
 export * from "./external-conversations.js";
+export * from "./fixture-allocation.js";
 export * from "./fixture-flags.js";
 export * from "./fixture-transport.js";
 export * from "./groups.js";

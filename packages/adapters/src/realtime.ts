@@ -115,6 +115,7 @@ export class PostgresRealtimeFanout implements RealtimeFanout {
   }
 
   private async connectClient(): Promise<void> {
+    fixtureConnectionPlan(this.options.connectionString);
     const candidate = this.clientFactory();
     this.connectingClient = candidate;
     const disconnected = () => this.handleDisconnect(candidate);

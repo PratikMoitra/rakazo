@@ -1,7 +1,10 @@
 // Phase-1 addition for the isolated workspace slice. Apache-2.0; see LICENSE. Not an upstream Rakazo file.
 // The only pg Client and Pool constructors for this branch live here. Remote TLS is not implemented.
+import { createRequire } from "node:module";
+import path from "node:path";
 import { Client, Pool } from "pg";
 import { parse as parseConnectionString } from "pg-connection-string";
+import { assertAllocationMatches } from "./fixture-allocation.js";
 
 /** Query keys that cannot change the host, port, database, login, password, socket, or TLS. */
 const BENIGN_PG_QUERY_KEYS = new Set(["application_name", "connect_timeout"]);
@@ -12,7 +15,8 @@ export const OPTIONS_REFUSAL = "DATABASE_WORKER_URL startup options are not expl
 export const PLAINTEXT_REFUSAL =
   "plaintext database transport requires an explicit disposable fixture on literal loopback";
 const LITERAL_LOOPBACK = new Set(["127.0.0.1", "::1"]);
-const FIXTURE_POOL = Symbol.for("rakazo.disposableFixturePool");
+const poolPlans = new WeakMap<Pool, FixtureConnectionPlan>();
+const require = createRequire(import.meta.url);
 
 /**
  * Fields taken from the installed pg connection-string parser. Clients are
@@ -111,6 +115,15 @@ export function explicitWorkerClientConfig(config: ExplicitPgConfig) {
   if (process.env.RAKAZO_DISPOSABLE_FIXTURE !== "1" || !LITERAL_LOOPBACK.has(config.host)) {
     throw new Error(PLAINTEXT_REFUSAL);
   }
+  if (
+    !config.user ||
+    !config.database ||
+    !Number.isInteger(config.port) ||
+    config.port < 1 ||
+    config.port > 65535
+  ) {
+    throw new Error(ENDPOINT_REFUSAL);
+  }
   if (!config.password) throw new Error(ENDPOINT_REFUSAL);
   if (process.env.PGSSLMODE) throw new Error(TLS_REFUSAL);
   if (process.env.PGOPTIONS) throw new Error(OPTIONS_REFUSAL);
@@ -129,7 +142,7 @@ export function explicitWorkerClientConfig(config: ExplicitPgConfig) {
 /** Validates one channel and returns fields. Does not open a client. */
 export function fixtureConnectionPlan(connectionString: string): FixtureConnectionPlan {
   const fields = explicitWorkerClientConfig(explicitPgConfig(connectionString));
-  return {
+  const plan = {
     host: fields.host,
     port: fields.port,
     database: fields.database,
@@ -137,6 +150,8 @@ export function fixtureConnectionPlan(connectionString: string): FixtureConnecti
     password: fields.password,
     ...(fields.application_name ? { application_name: fields.application_name } : {}),
   };
+  assertAllocationMatches(plan);
+  return plan;
 }
 
 /**
@@ -159,9 +174,18 @@ export function openExplicitClient(
   connectionTimeoutMillis?: number,
 ): Client {
   const fields = explicitWorkerClientConfig(config);
-  return new Client(
-    connectionTimeoutMillis === undefined ? fields : { ...fields, connectionTimeoutMillis },
-  );
+  assertAllocationMatches(fields);
+  const approved = {
+    host: fields.host,
+    port: fields.port,
+    database: fields.database,
+    user: fields.user,
+    password: fields.password,
+    application_name: fields.application_name,
+    ssl: false as const,
+    ...(connectionTimeoutMillis === undefined ? {} : { connectionTimeoutMillis }),
+  };
+  return new Client(approved);
 }
 
 export interface FixtureClientOptions {
@@ -213,14 +237,33 @@ export function openFixturePool(connectionString: string, options: FixturePoolOp
     idleTimeoutMillis: options.idleTimeoutMillis ?? 0,
     keepAlive: options.keepAlive ?? true,
   });
-  Object.defineProperty(pool, FIXTURE_POOL, { value: plan });
+  poolPlans.set(pool, plan);
+  const connect = pool.connect.bind(pool);
+  pool.connect = ((...args: unknown[]) => {
+    assertPoolRoute(pool, plan);
+    return connect(...(args as []));
+  }) as Pool["connect"];
   return pool;
 }
 
-export function assertApprovedPool(pool: Pool): void {
-  if (!(FIXTURE_POOL in pool)) {
-    throw new Error("database pool was not opened by the disposable fixture transport");
+function assertPoolRoute(pool: Pool, plan: FixtureConnectionPlan): void {
+  const options = pool.options;
+  if (
+    !options ||
+    options.host !== plan.host ||
+    Number(options.port) !== plan.port ||
+    options.database !== plan.database ||
+    options.user !== plan.user ||
+    options.ssl !== false
+  ) {
+    throw new Error("database pool no longer matches its approved fixture plan");
   }
+}
+
+export function assertApprovedPool(pool: Pool): void {
+  const plan = poolPlans.get(pool);
+  if (!plan) throw new Error("database pool was not opened by the disposable fixture transport");
+  assertPoolRoute(pool, plan);
 }
 
 /**
@@ -229,40 +272,81 @@ export function assertApprovedPool(pool: Pool): void {
  */
 export function fixtureEngineUrl(connectionString: string, lockTimeoutMs?: number): string {
   const plan = fixtureConnectionPlan(connectionString);
-  const url = new URL("postgres://127.0.0.1/db");
-  url.username = plan.user;
-  url.password = plan.password;
-  url.hostname = plan.host;
-  url.port = String(plan.port);
-  url.pathname = `/${plan.database}`;
-  if (lockTimeoutMs !== undefined) {
-    if (!Number.isInteger(lockTimeoutMs) || lockTimeoutMs < 1 || lockTimeoutMs > 600_000) {
-      throw new Error(ENDPOINT_REFUSAL);
-    }
-    url.searchParams.set("options", `-c lock_timeout=${lockTimeoutMs}`);
+  if (
+    lockTimeoutMs !== undefined &&
+    (!Number.isInteger(lockTimeoutMs) || lockTimeoutMs < 1 || lockTimeoutMs > 600_000)
+  ) {
+    throw new Error(ENDPOINT_REFUSAL);
   }
-  return url.toString();
+  const host = plan.host.includes(":") ? `[${plan.host}]` : plan.host;
+  const query =
+    lockTimeoutMs === undefined
+      ? ""
+      : `?options=${encodeURIComponent(`-c lock_timeout=${lockTimeoutMs}`)}`;
+  const built = `postgres://${encodeURIComponent(plan.user)}:${encodeURIComponent(plan.password)}@${host}:${plan.port}/${encodeURIComponent(plan.database)}${query}`;
+  let again: ReturnType<typeof parseConnectionString>;
+  try {
+    again = parseConnectionString(built);
+  } catch {
+    throw new Error(ENDPOINT_REFUSAL);
+  }
+  const port = again.port ? Number(again.port) : 5432;
+  if (
+    again.host !== plan.host ||
+    port !== plan.port ||
+    again.database !== plan.database ||
+    again.user !== plan.user ||
+    again.password !== plan.password
+  ) {
+    throw new Error(ENDPOINT_REFUSAL);
+  }
+  if (lockTimeoutMs !== undefined && again.options !== `-c lock_timeout=${lockTimeoutMs}`) {
+    throw new Error(ENDPOINT_REFUSAL);
+  }
+  return built;
 }
 
-/** Child environment for the migration engine. Ambient PG* routing is not copied. */
+const ENGINE_ENV_ALLOW = ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"] as const;
+const ENGINE_EXTRA_REFUSAL = "migration engine environment refuses a protected override";
+
+/** Minimal child environment. Caller extras cannot replace the approved URL or routing settings. */
 export function fixtureEngineEnv(
   engineUrl: string,
   extra: Record<string, string | undefined> = {},
 ): NodeJS.ProcessEnv {
+  for (const key of Object.keys(extra)) {
+    if (
+      key.startsWith("PG") ||
+      key.startsWith("PRISMA_") ||
+      key.startsWith("DATABASE_") ||
+      key === "NODE_OPTIONS" ||
+      key === "NODE_PATH" ||
+      key === "REALTIME_DATABASE_URL" ||
+      key === "DOTENV_CONFIG_PATH" ||
+      key === "PATH"
+    ) {
+      throw new Error(ENGINE_EXTRA_REFUSAL);
+    }
+  }
   const env: NodeJS.ProcessEnv = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (value === undefined) continue;
-    if (key.startsWith("PG")) continue;
-    if (key === "DATABASE_URL" || key === "DATABASE_MIGRATION_URL" || key === "DATABASE_WORKER_URL")
-      continue;
-    if (key === "REALTIME_DATABASE_URL") continue;
-    env[key] = value;
+  for (const key of ENGINE_ENV_ALLOW) {
+    const value = process.env[key];
+    if (value !== undefined) env[key] = value;
   }
   env.DATABASE_URL = engineUrl;
   env.DATABASE_MIGRATION_URL = engineUrl;
   env.RAKAZO_DISPOSABLE_FIXTURE = "1";
+  if (process.env.RAKAZO_FIXTURE_HANDLE)
+    env.RAKAZO_FIXTURE_HANDLE = process.env.RAKAZO_FIXTURE_HANDLE;
+  if (process.env.RAKAZO_FIXTURE_TOKEN) env.RAKAZO_FIXTURE_TOKEN = process.env.RAKAZO_FIXTURE_TOKEN;
   for (const [key, value] of Object.entries(extra)) {
     if (value !== undefined) env[key] = value;
   }
   return env;
+}
+
+/** Resolves the installed Prisma CLI. An ambient engine binary is not consulted. */
+export function pinnedPrismaCli(): string {
+  const pkg = require.resolve("prisma/package.json");
+  return path.join(path.dirname(pkg), "build/index.js");
 }

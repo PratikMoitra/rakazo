@@ -1,3 +1,6 @@
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import type { Client } from "pg";
 import { describe, expect, it } from "vitest";
 import {
@@ -6,6 +9,11 @@ import {
   rowSecurityWarning,
   scramSha256Verifier,
 } from "./database-access.js";
+import {
+  publishFixtureHandle,
+  registerFixtureAllocation,
+  revokeFixtureAllocation,
+} from "./fixture-allocation.js";
 
 const sent: string[] = [];
 function open(): Client {
@@ -94,7 +102,18 @@ describe("provisionRuntimeRole", () => {
   it("sets the runtime password without sending it to the server", async () => {
     sent.length = 0;
     const previous = process.env.RAKAZO_DISPOSABLE_FIXTURE;
-    process.env.RAKAZO_DISPOSABLE_FIXTURE = "1";
+    const root = mkdtempSync(path.join(tmpdir(), "phase1-role-"));
+    const data = path.join(root, "data");
+    mkdirSync(data);
+    const handle = registerFixtureAllocation({
+      host: "127.0.0.1",
+      port: 9,
+      database: "rakazo",
+      users: ["rakazo", "rakazo_app"],
+      dataDirectory: data,
+      root,
+    });
+    const release = publishFixtureHandle(handle);
     try {
       await provisionRuntimeRole(
         "postgres://rakazo:owner-password@127.0.0.1:9/rakazo",
@@ -105,6 +124,9 @@ describe("provisionRuntimeRole", () => {
       expect(setPassword).toMatch(/^CREATE ROLE "rakazo_app" LOGIN PASSWORD 'SCRAM-SHA-256\$4096:/);
       expect(sent.join("\n")).not.toContain("app-password");
     } finally {
+      release();
+      revokeFixtureAllocation(handle);
+      rmSync(root, { recursive: true, force: true });
       if (previous === undefined) delete process.env.RAKAZO_DISPOSABLE_FIXTURE;
       else process.env.RAKAZO_DISPOSABLE_FIXTURE = previous;
     }

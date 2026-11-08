@@ -6,11 +6,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { performCredentialCleanup } from "@rakazo/adapters";
 import {
+  allowFixtureIdentity,
   countLegacyCredentialJobs,
   createDb,
   createPool,
+  fixtureConnectionPlan,
   preflightCredentialWorker,
   preflightQueueBoundary,
+  publishFixtureHandle,
 } from "@rakazo/db";
 import { expect, it } from "vitest";
 import { startFixtureCluster } from "./phase1-fixture-cluster.js";
@@ -22,7 +25,8 @@ it.skipIf(!existsSync("/usr/lib/postgresql/16/bin/initdb"))(
     const previousFixture = process.env.RAKAZO_DISPOSABLE_FIXTURE;
     process.env.RAKAZO_DISPOSABLE_FIXTURE = "1";
     const refusal = await startFixtureCluster();
-    let success: { url: URL; stop: () => Promise<void> } | undefined;
+    const releaseHandle = publishFixtureHandle(refusal.handle);
+    let success: Awaited<ReturnType<typeof startFixtureCluster>> | undefined;
     const databaseUrl = refusal.url.toString();
     const adminUrl = refusal.url;
     let refusalStopped = false;
@@ -116,6 +120,8 @@ it.skipIf(!existsSync("/usr/lib/postgresql/16/bin/initdb"))(
       await refusal.stop();
       refusalStopped = true;
       success = await startFixtureCluster();
+      releaseHandle();
+      publishFixtureHandle(success.handle);
       try {
         const fresh = success.url;
         const freshWorker = loginUrl(fresh, "rakazo_credential_worker", "phase1-worker-password");
@@ -628,6 +634,7 @@ it.skipIf(!existsSync("/usr/lib/postgresql/16/bin/initdb"))(
       }
     } finally {
       if (!refusalStopped) await refusal.stop();
+      releaseHandle();
       if (previousFixture === undefined) delete process.env.RAKAZO_DISPOSABLE_FIXTURE;
       else process.env.RAKAZO_DISPOSABLE_FIXTURE = previousFixture;
     }
@@ -659,6 +666,9 @@ function runMigrate(database: URL, workerUrl: URL, runtimeUrl?: URL) {
           migrationUrl: database.toString(),
           workerUrl: workerUrl.toString(),
           realtimeUrl: database.toString(),
+          handlePath: process.env.RAKAZO_FIXTURE_HANDLE ?? "",
+          token: process.env.RAKAZO_FIXTURE_TOKEN ?? "",
+          allocationId: process.env.RAKAZO_OWNED_FIXTURE_ID ?? "",
         }),
       },
       (error, stdout, stderr) => {
@@ -696,6 +706,9 @@ function startWorkerMain(
         migrationUrl: database.toString(),
         workerUrl: workerUrl.toString(),
         realtimeUrl: database.toString(),
+        handlePath: process.env.RAKAZO_FIXTURE_HANDLE ?? "",
+        token: process.env.RAKAZO_FIXTURE_TOKEN ?? "",
+        allocationId: process.env.RAKAZO_OWNED_FIXTURE_ID ?? "",
       }),
     },
   );
@@ -760,6 +773,12 @@ async function createFreshDatabase(adminUrl: URL): Promise<URL> {
   const pool = createPool(adminUrl.toString());
   await pool.query(`CREATE DATABASE "${name}"`);
   await pool.end();
+  const handlePath = process.env.RAKAZO_FIXTURE_HANDLE;
+  const token = process.env.RAKAZO_FIXTURE_TOKEN;
+  const id = process.env.RAKAZO_OWNED_FIXTURE_ID;
+  if (!handlePath || !token || !id)
+    throw new Error("database target is not an owned fixture allocation");
+  allowFixtureIdentity({ path: handlePath, token, id }, { database: name });
   const url = new URL(adminUrl.toString());
   url.pathname = `/${name}`;
   return url;
@@ -814,18 +833,19 @@ async function seedLegacyQueue(database: URL): Promise<void> {
 }
 
 function psql(url: URL, sql: string) {
+  const plan = fixtureConnectionPlan(url.toString());
   return new Promise<void>((resolve, reject) => {
     execFile(
       "psql",
       [
         "-h",
-        url.hostname,
+        plan.host,
         "-p",
-        url.port || "5432",
+        String(plan.port),
         "-U",
-        decodeURIComponent(url.username),
+        plan.user,
         "-d",
-        url.pathname.slice(1),
+        plan.database,
         "-v",
         "ON_ERROR_STOP=1",
         "-c",
@@ -834,7 +854,7 @@ function psql(url: URL, sql: string) {
       {
         env: {
           PATH: process.env.PATH ?? "",
-          PGPASSWORD: decodeURIComponent(url.password),
+          PGPASSWORD: plan.password,
         },
       },
       (error, stdout, stderr) => {

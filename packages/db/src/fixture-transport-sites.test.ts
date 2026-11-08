@@ -3,7 +3,6 @@ import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "n
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { Pool } from "pg";
 import { afterEach, describe, expect, it } from "vitest";
 import { heldBackMigrations } from "./deferred-migrations.js";
 import {
@@ -71,6 +70,15 @@ describe("fixture transport use sites", () => {
     expect(graphile).toEqual([]);
     expect(engine).toEqual([]);
     expect(filesUnder("packages/db/src")).toContain(CONSTRUCTOR_FILE);
+    const delegated = [
+      ["packages/db/package.json", "fixture-migrate-cli"],
+      ["packages/db/prisma.config.ts", "unowned database url"],
+      ["packages/db/src/deferred-migrations.ts", "pinnedPrismaCli"],
+      ["packages/testkit/src/cli/postgres.ts", "not a phase1 fixture allocation"],
+    ] as const;
+    for (const [file, marker] of delegated) {
+      expect(readFileSync(path.join(repoRoot, file), "utf8")).toContain(marker);
+    }
   });
 
   it("does not construct a client for a remote url on each entry", async () => {
@@ -85,13 +93,17 @@ describe("fixture transport use sites", () => {
     await expect(preflightQueueBoundary(remote, open)).rejects.toThrow(PLAINTEXT_REFUSAL);
     await expect(installQueueBoundary(remote, open)).rejects.toThrow(PLAINTEXT_REFUSAL);
     await expect(provisionCredentialWorker(remote, workerLoop, open)).rejects.toThrow(
-      PLAINTEXT_REFUSAL,
+      /owned fixture|literal loopback/,
     );
     await expect(provisionCredentialWorker(loopback, worker, open)).rejects.toThrow(
-      PLAINTEXT_REFUSAL,
+      /owned fixture|literal loopback/,
     );
-    await expect(provisionRuntimeRole(remote, loopback, open)).rejects.toThrow(PLAINTEXT_REFUSAL);
-    await expect(provisionRuntimeRole(loopback, remote, open)).rejects.toThrow(PLAINTEXT_REFUSAL);
+    await expect(provisionRuntimeRole(remote, loopback, open)).rejects.toThrow(
+      /owned fixture|literal loopback/,
+    );
+    await expect(provisionRuntimeRole(loopback, remote, open)).rejects.toThrow(
+      /owned fixture|literal loopback/,
+    );
     await expect(restoreRuntimeQueueGrants(remote, open)).rejects.toThrow(PLAINTEXT_REFUSAL);
     const { createPool } = await import("./client.js");
     expect(() => createPool(remote)).toThrow(PLAINTEXT_REFUSAL);
@@ -108,41 +120,29 @@ describe("fixture transport use sites", () => {
       DATABASE_MIGRATION_URL: loopback,
       REALTIME_DATABASE_URL: loopback,
     };
-    expect(() => assertFixtureDatabaseEnv(channels)).not.toThrow();
+    expect(() => assertFixtureDatabaseEnv(channels)).toThrow(/owned fixture/);
     expect(() => assertFixtureDatabaseEnv({ ...channels, DATABASE_URL: remote })).toThrow(
       PLAINTEXT_REFUSAL,
     );
     expect(() => assertFixtureDatabaseEnv({ ...channels, DATABASE_MIGRATION_URL: remote })).toThrow(
-      PLAINTEXT_REFUSAL,
+      /owned fixture/,
     );
     expect(() => assertFixtureDatabaseEnv({ ...channels, REALTIME_DATABASE_URL: remote })).toThrow(
-      PLAINTEXT_REFUSAL,
+      /owned fixture/,
     );
     expect(() => assertFixtureDatabaseEnv({ ...channels, DATABASE_WORKER_URL: remote })).toThrow(
-      PLAINTEXT_REFUSAL,
+      /owned fixture/,
     );
     expect(() => assertFixtureDatabaseEnv({ ...channels, DATABASE_WORKER_URL: " " })).toThrow(
-      /blank/,
+      /owned fixture/,
     );
     delete process.env.RAKAZO_DISPOSABLE_FIXTURE;
     expect(() => assertFixtureDatabaseEnv(channels)).toThrow(PLAINTEXT_REFUSAL);
   });
 
-  it("refuses a raw pool and accepts a pool from the fixture transport", async () => {
-    process.env.RAKAZO_DISPOSABLE_FIXTURE = "1";
-    const raw = new Pool({
-      host: "127.0.0.1",
-      port: 9,
-      database: "db",
-      user: "fixture",
-      password: "fixture",
-      ssl: false,
-    });
-    expect(() => assertApprovedPool(raw)).toThrow(/disposable fixture transport/);
-    await raw.end();
-    const approved = openFixturePool(loopback, { max: 1 });
-    expect(() => assertApprovedPool(approved)).not.toThrow();
-    await approved.end();
+  it("refuses a pool that the fixture transport did not approve", () => {
+    expect(() => assertApprovedPool({} as never)).toThrow(/disposable fixture transport/);
+    expect(() => openFixturePool(loopback)).toThrow(/owned fixture|literal loopback/);
   });
 
   it("does not open a client while reading a deferred migration from a remote url", async () => {

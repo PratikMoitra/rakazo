@@ -8,6 +8,7 @@ import {
   fixtureEngineEnv,
   fixtureEngineUrl,
   openFixtureClient,
+  pinnedPrismaCli,
 } from "./fixture-transport.js";
 
 /** First line of a migration that may only run once the release before it has stopped. */
@@ -164,6 +165,11 @@ export async function deployMigrations(input: {
   lockRetryDelaysMs?: number[];
   lockTimeoutMs?: number;
   previousMigrations?: readonly string[];
+  spawn?: (
+    command: string,
+    args: readonly string[],
+    options: { cwd: string; env: NodeJS.ProcessEnv; stdio: "inherit" },
+  ) => unknown;
 }) {
   fixtureConnectionPlan(input.migrationUrl);
   const migrationsDir = input.migrationsDir ?? path.join(input.dbPackageDir, "prisma/migrations");
@@ -188,7 +194,7 @@ export async function deployMigrations(input: {
       : fixtureEngineUrl(input.migrationUrl, input.lockTimeoutMs ?? LOCK_TIMEOUT_MS);
     for (let attempt = 0; ; attempt++) {
       try {
-        execFileSync("pnpm", ["exec", "prisma", "migrate", "deploy"], {
+        (input.spawn ?? execFileSync)(process.execPath, [pinnedPrismaCli(), "migrate", "deploy"], {
           cwd: input.dbPackageDir,
           stdio: "inherit",
           env: fixtureEngineEnv(deployUrl, { RAKAZO_MIGRATIONS_PATH: migrationsPath }),

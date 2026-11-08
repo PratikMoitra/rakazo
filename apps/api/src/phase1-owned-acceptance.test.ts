@@ -1,52 +1,125 @@
 // Phase-1 addition for the isolated workspace slice. Apache-2.0; see LICENSE. Not an upstream Rakazo file.
+import type { ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
+import { restoreEnv } from "@rakazo/db";
 import { expect, it } from "vitest";
-import { ownedAcceptanceEnv } from "./phase1-owned-acceptance.js";
+import {
+  allocateAll,
+  ownedAcceptanceEnv,
+  runOwnedProcess,
+  stopAll,
+} from "./phase1-owned-acceptance.js";
 
-it("derives acceptance channels from the owned cluster and ignores an ambient database url", () => {
-  const previous = process.env.DATABASE_URL;
+const handle = { id: "allocation-id", token: "token", path: "/tmp/phase1-allocation.json" };
+
+it("derives acceptance channels from the allocation and restores every env key", () => {
+  const previous = {
+    DATABASE_URL: process.env.DATABASE_URL,
+    DATABASE_MIGRATION_URL: process.env.DATABASE_MIGRATION_URL,
+    PGSSLMODE: process.env.PGSSLMODE,
+  };
   process.env.DATABASE_URL = "postgres://ambient:ambient@example/db";
   process.env.DATABASE_MIGRATION_URL = "postgres://ambient:ambient@example/db";
   process.env.PGSSLMODE = "no-verify";
   try {
-    const admin = new URL("postgres://fixture_admin:secret@127.0.0.1:54321/postgres");
-    const env = ownedAcceptanceEnv(admin, "suite-a");
+    const admin = new URL("postgres://fixture_admin:secret@127.0.0.1:9/postgres");
+    const env = ownedAcceptanceEnv(admin, handle);
     expect(env.DATABASE_URL).not.toContain("example");
     expect(env.DATABASE_MIGRATION_URL).not.toContain("example");
-    expect(env.DATABASE_WORKER_URL).not.toContain("example");
-    expect(env.REALTIME_DATABASE_URL).not.toContain("example");
-    expect(new URL(env.DATABASE_URL!).port).toBe("54321");
-    expect(new URL(env.DATABASE_MIGRATION_URL!).port).toBe("54321");
-    expect(new URL(env.DATABASE_WORKER_URL!).port).toBe("54321");
-    expect(new URL(env.REALTIME_DATABASE_URL!).port).toBe("54321");
-    expect(new URL(env.DATABASE_URL!).hostname).toBe("127.0.0.1");
+    expect(new URL(env.DATABASE_URL!).port).toBe("9");
+    expect(new URL(env.DATABASE_MIGRATION_URL!).port).toBe("9");
     expect(new URL(env.DATABASE_URL!).username).toBe("rakazo_phase1_runtime");
     expect(new URL(env.DATABASE_MIGRATION_URL!).username).toBe("fixture_admin");
-    expect(env.RAKAZO_OWNED_FIXTURE_ID).toBe("suite-a");
-    expect(env.RAKAZO_DISPOSABLE_FIXTURE).toBe("1");
+    expect(env.RAKAZO_OWNED_FIXTURE_ID).toBe(handle.id);
+    expect(env.RAKAZO_FIXTURE_HANDLE).toBe(handle.path);
+    expect(env.RAKAZO_FIXTURE_TOKEN).toBe(handle.token);
     expect(env.PGSSLMODE).toBeUndefined();
-    expect(Object.keys(env).sort()).toEqual(
-      [
-        "AGENT_RUNTIME",
-        "DATABASE_MIGRATION_URL",
-        "DATABASE_URL",
-        "DATABASE_WORKER_URL",
-        "DB_POOL_MAX",
-        "ENCRYPTION_KEY",
-        "NODE_ENV",
-        "PATH",
-        "PHASE1_FIXTURE_CLUSTER",
-        "RAKAZO_ALLOW_DEV_SECRETS",
-        "RAKAZO_DISPOSABLE_FIXTURE",
-        "RAKAZO_OWNED_FIXTURE_ID",
-        "REALTIME_DATABASE_URL",
-        "SANDBOX_PROVIDER",
-        "VERIFY_DATABASE",
-      ].sort(),
-    );
+    expect(env.NODE_OPTIONS).toBeUndefined();
   } finally {
-    if (previous === undefined) delete process.env.DATABASE_URL;
-    else process.env.DATABASE_URL = previous;
-    delete process.env.DATABASE_MIGRATION_URL;
-    delete process.env.PGSSLMODE;
+    restoreEnv(previous);
   }
+  expect(process.env.DATABASE_URL).toBe(previous.DATABASE_URL);
+  expect(process.env.DATABASE_MIGRATION_URL).toBe(previous.DATABASE_MIGRATION_URL);
+  expect(process.env.PGSSLMODE).toBe(previous.PGSSLMODE);
+});
+
+it("stops every successful allocation when a later one fails", async () => {
+  const stopped: string[] = [];
+  const errors: unknown[] = [];
+  await expect(
+    allocateAll([
+      async () => ({ stop: async () => void stopped.push("first") }),
+      async () => {
+        throw new Error("second failed");
+      },
+    ]),
+  ).rejects.toThrow(/fixture allocation failed/);
+  expect(stopped).toEqual(["first"]);
+  await expect(
+    stopAll([
+      async () => {
+        throw new Error("stop-a");
+      },
+      async () => {
+        throw new Error("stop-b");
+      },
+    ]),
+  ).rejects.toThrow(/fixture stop failed/);
+  try {
+    await stopAll([
+      async () => {
+        throw new Error("stop-a");
+      },
+      async () => {
+        throw new Error("stop-b");
+      },
+    ]);
+  } catch (error) {
+    errors.push(error);
+  }
+  expect(errors[0]).toBeInstanceOf(AggregateError);
+  expect((errors[0] as AggregateError).errors).toHaveLength(2);
+});
+
+it("kills an owned child on spawn failure and timeout before the caller continues", async () => {
+  const signals: number[] = [];
+  const failed = runOwnedProcess(
+    "missing",
+    [],
+    {},
+    {
+      spawn: () => {
+        throw new Error("spawn failed");
+      },
+    },
+  );
+  const spawnResult = await failed.result;
+  expect(spawnResult.error?.message).toBe("spawn failed");
+  await failed.killAndWait();
+
+  const child = new EventEmitter() as ChildProcess & EventEmitter;
+  child.stdout = new EventEmitter() as ChildProcess["stdout"];
+  child.stderr = new EventEmitter() as ChildProcess["stderr"];
+  Object.defineProperty(child, "pid", { value: 424242 });
+  child.kill = () => {
+    child.emit("close", null);
+    return true;
+  };
+  const hanging = runOwnedProcess(
+    "sleep",
+    [],
+    {},
+    {
+      timeoutMs: 20,
+      signalProcess: (pid) => {
+        signals.push(pid);
+        child.emit("close", null);
+      },
+      spawn: () => child,
+    },
+  );
+  const timed = await hanging.result;
+  expect(timed.error?.message).toMatch(/timed out/);
+  expect(signals.some((pid) => Math.abs(pid) === 424242)).toBe(true);
+  await hanging.killAndWait();
 });

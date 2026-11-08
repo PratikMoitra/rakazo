@@ -3,7 +3,13 @@
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import type { PrismaClient } from "@rakazo/db";
-import { createDb, describeRowSecurity, provisionRuntimeRole, runAsSystem } from "@rakazo/db";
+import {
+  createDb,
+  describeRowSecurity,
+  provisionRuntimeRole,
+  publishFixtureHandle,
+  runAsSystem,
+} from "@rakazo/db";
 import { expect, it } from "vitest";
 import { startFixtureCluster } from "./phase1-fixture-cluster.js";
 import { fixtureChildEnv } from "./phase1-fixture-env.js";
@@ -12,6 +18,7 @@ it.skipIf(!existsSync("/usr/lib/postgresql/16/bin/initdb"))(
   "shows a second runtime password replaces the database bypass key",
   async () => {
     const cluster = await startFixtureCluster();
+    const releaseHandle = publishFixtureHandle(cluster.handle);
     const previous = process.env.RAKAZO_DISPOSABLE_FIXTURE;
     process.env.RAKAZO_DISPOSABLE_FIXTURE = "1";
     const admin = cluster.url;
@@ -65,6 +72,7 @@ it.skipIf(!existsSync("/usr/lib/postgresql/16/bin/initdb"))(
       await db?.prisma.$disconnect();
       await db?.pool.end();
       await cluster.stop();
+      releaseHandle();
       if (previous === undefined) delete process.env.RAKAZO_DISPOSABLE_FIXTURE;
       else process.env.RAKAZO_DISPOSABLE_FIXTURE = previous;
     }
@@ -105,6 +113,9 @@ function migrate(admin: URL, runtime: URL, worker: URL) {
           migrationUrl: admin.toString(),
           workerUrl: worker.toString(),
           realtimeUrl: admin.toString(),
+          handlePath: process.env.RAKAZO_FIXTURE_HANDLE ?? "",
+          token: process.env.RAKAZO_FIXTURE_TOKEN ?? "",
+          allocationId: process.env.RAKAZO_OWNED_FIXTURE_ID ?? "",
         }),
       },
       (error, stdout, stderr) => {

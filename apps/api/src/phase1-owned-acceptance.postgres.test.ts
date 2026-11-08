@@ -3,7 +3,12 @@
 import { existsSync } from "node:fs";
 import { expect, it } from "vitest";
 import { startFixtureCluster } from "./phase1-fixture-cluster.js";
-import { ownedAcceptanceEnv, runOwnedProcess } from "./phase1-owned-acceptance.js";
+import {
+  allocateAll,
+  ownedAcceptanceEnv,
+  runOwnedProcess,
+  stopAll,
+} from "./phase1-owned-acceptance.js";
 
 const enabled = existsSync("/usr/lib/postgresql/16/bin/initdb");
 const suites = [
@@ -22,25 +27,32 @@ it.skipIf(!enabled)(
   async () => {
     for (const [name, file] of suites) {
       const cluster = await startFixtureCluster();
-      const env = ownedAcceptanceEnv(cluster.url, `${name}-${cluster.url.port}`);
+      const env = ownedAcceptanceEnv(cluster.url, cluster.handle);
+      const children: Array<{ killAndWait: () => Promise<void> }> = [];
       try {
-        const migrated = await runOwnedProcess(
-          "pnpm",
-          ["--filter", "@rakazo/api", "db:migrate"],
-          env,
-        );
-        if (migrated.code !== 0)
+        const migrate = runOwnedProcess("pnpm", ["--filter", "@rakazo/api", "db:migrate"], env);
+        children.push(migrate);
+        const migrated = await migrate.result;
+        if (migrated.code !== 0 || migrated.error)
           throw new Error(`${name} migrate failed\n${redact(migrated.output)}`);
-        const ran = await runOwnedProcess(
+        const ranChild = runOwnedProcess(
           "pnpm",
           ["exec", "vitest", "run", file, "--reporter=dot"],
           env,
         );
+        children.push(ranChild);
+        const ran = await ranChild.result;
         const report = redact(ran.output);
-        if (ran.code !== 0 || !/\d+ passed/.test(report) || /\d+ skipped/.test(report)) {
+        if (
+          ran.code !== 0 ||
+          ran.error ||
+          !/\d+ passed/.test(report) ||
+          /\d+ skipped/.test(report)
+        ) {
           throw new Error(`${name} failed\n${report}`);
         }
       } finally {
+        await stopAll(children.map((child) => () => child.killAndWait()));
         await cluster.stop();
       }
     }
@@ -51,10 +63,14 @@ it.skipIf(!enabled)(
 it.skipIf(!enabled)(
   "allocates concurrent acceptance processes on distinct clusters",
   async () => {
-    const [first, second] = await Promise.all([startFixtureCluster(), startFixtureCluster()]);
+    let clusters: Awaited<ReturnType<typeof startFixtureCluster>>[] = [];
     try {
-      const envA = ownedAcceptanceEnv(first.url, "concurrent-a");
-      const envB = ownedAcceptanceEnv(second.url, "concurrent-b");
+      clusters = await allocateAll([() => startFixtureCluster(), () => startFixtureCluster()]);
+      const first = clusters[0];
+      const second = clusters[1];
+      if (!first || !second) throw new Error("fixture allocation failed");
+      const envA = ownedAcceptanceEnv(first.url, first.handle);
+      const envB = ownedAcceptanceEnv(second.url, second.handle);
       expect(first.url.port).not.toBe(second.url.port);
       const probe = [
         "exec",
@@ -63,19 +79,19 @@ it.skipIf(!enabled)(
         "apps/api/src/phase1-owned-acceptance-probe.postgres.test.ts",
         "--reporter=verbose",
       ];
-      const [ranA, ranB] = await Promise.all([
-        runOwnedProcess("pnpm", probe, envA),
-        runOwnedProcess("pnpm", probe, envB),
-      ]);
-      expect(ranA.code, redact(ranA.output)).toBe(0);
-      expect(ranB.code, redact(ranB.output)).toBe(0);
-      expect(ranA.output).toContain(`owned-target concurrent-a ${first.url.port}`);
-      expect(ranB.output).toContain(`owned-target concurrent-b ${second.url.port}`);
-      expect(ranA.output).not.toContain(`concurrent-b ${second.url.port}`);
-      expect(ranB.output).not.toContain(`concurrent-a ${first.url.port}`);
+      const childA = runOwnedProcess("pnpm", probe, envA);
+      const childB = runOwnedProcess("pnpm", probe, envB);
+      try {
+        const [ranA, ranB] = await Promise.all([childA.result, childB.result]);
+        expect(ranA.code, redact(ranA.output)).toBe(0);
+        expect(ranB.code, redact(ranB.output)).toBe(0);
+        expect(ranA.output).toContain(`owned-target ${first.handle.id} ${first.url.port}`);
+        expect(ranB.output).toContain(`owned-target ${second.handle.id} ${second.url.port}`);
+      } finally {
+        await stopAll([() => childA.killAndWait(), () => childB.killAndWait()]);
+      }
     } finally {
-      await first.stop();
-      await second.stop();
+      await stopAll(clusters.map((cluster) => () => cluster.stop()));
     }
   },
   180_000,

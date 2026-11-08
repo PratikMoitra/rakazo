@@ -29,9 +29,8 @@ const INTERACTIVE_RUN_TASK = "run.interactive";
 type RunLookup = Pick<PrismaClient, "run">;
 type Workload = "interactive" | "background" | "maintenance";
 
-function requireFixturePool(pool: Pool): void {
-  // Unit doubles have no pg options. A real pool must come from the fixture transport.
-  if (pool.options) assertApprovedPool(pool);
+function requireFixturePool(pool: Pool, check: (pool: Pool) => void = assertApprovedPool): void {
+  check(pool);
 }
 
 async function isInteractiveRun(prisma: RunLookup, runId: string): Promise<boolean> {
@@ -62,8 +61,9 @@ export class GraphileJobPublisher implements JobPublisher {
   constructor(
     private readonly pgPool: Pool,
     private readonly prisma?: RunLookup,
+    poolCheck?: (pool: Pool) => void,
   ) {
-    requireFixturePool(pgPool);
+    requireFixturePool(pgPool, poolCheck);
   }
 
   async enqueue(job: BackgroundJob): Promise<void> {
@@ -252,9 +252,11 @@ export class GraphileJobWorkerHost implements JobWorkerHost {
       drainTimeoutMs?: number;
       /** Registers the opaque credential-cleanup dispatcher. Off unless the worker login is distinct. */
       credentialCleanup?: boolean;
+      /** Test double injection. Production callers leave this unset. */
+      poolCheck?: (pool: Pool) => void;
     } = {},
   ) {
-    requireFixturePool(pgPool);
+    requireFixturePool(pgPool, options.poolCheck);
   }
 
   async start(handlers: BackgroundJobHandlers): Promise<void> {
@@ -465,7 +467,12 @@ const MAINTENANCE_LOCAL_QUEUE_SIZE = 10;
 /** Long agent turns cannot occupy the capacity reserved for other workloads. */
 export function createReservedGraphileJobWorkerHost(
   pool: Pool,
-  options: { concurrency?: number; pollInterval?: number; credentialCleanup?: boolean } = {},
+  options: {
+    concurrency?: number;
+    pollInterval?: number;
+    credentialCleanup?: boolean;
+    poolCheck?: (pool: Pool) => void;
+  } = {},
 ): JobWorkerHost {
   const hosts = (["interactive", "background", "maintenance"] as const).map(
     (workload) =>

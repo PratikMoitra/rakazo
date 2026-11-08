@@ -6,6 +6,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { type FixtureHandle, registerFixtureAllocation, revokeFixtureAllocation } from "@rakazo/db";
 
 const BIN = "/usr/lib/postgresql/16/bin";
 /** pg_ctl status exit when this data directory has no running server. */
@@ -23,7 +24,7 @@ export async function startFixtureCluster(
     remove?: (path: string) => Promise<void>;
     directory?: string;
   } = {},
-): Promise<{ url: URL; stop: () => Promise<void> }> {
+): Promise<{ url: URL; handle: FixtureHandle; stop: () => Promise<void> }> {
   const run = control.run ?? runCommand;
   const remove = control.remove ?? ((path: string) => rm(path, { recursive: true, force: true }));
   const root = control.directory ?? (await mkdtemp(join(tmpdir(), "phase1-cluster-")));
@@ -58,9 +59,26 @@ export async function startFixtureCluster(
     const url = new URL("postgres://fixture_admin@127.0.0.1/postgres");
     url.port = String(port);
     url.password = password;
+    const handle = registerFixtureAllocation({
+      host: "127.0.0.1",
+      port,
+      database: "postgres",
+      users: [
+        "fixture_admin",
+        "rakazo_phase1_api",
+        "rakazo_phase1_runtime",
+        "rakazo_credential_worker",
+      ],
+      dataDirectory: data,
+      root,
+    });
     return {
       url,
-      stop: () => cleanupFixtureDataDirectory({ data, root, startAttempted: true, run, remove }),
+      handle,
+      stop: async () => {
+        await cleanupFixtureDataDirectory({ data, root, startAttempted: true, run, remove });
+        revokeFixtureAllocation(handle);
+      },
     };
   } catch (error) {
     await cleanupFixtureDataDirectory({ data, root, startAttempted, run, remove });

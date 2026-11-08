@@ -11,6 +11,9 @@ it("does not copy an ambient sentinel into a fixture child", async () => {
     migrationUrl: "postgres://fixture@127.0.0.1:1/fixture",
     workerUrl: "postgres://worker@127.0.0.1:1/fixture",
     realtimeUrl: "postgres://fixture@127.0.0.1:1/fixture",
+    handlePath: "/tmp/phase1-fixture-handle",
+    token: "token",
+    allocationId: "allocation",
   });
   expect(env.PHASE1_SENTINEL_SHOULD_NOT_LEAK).toBeUndefined();
   expect(env.REALTIME_DATABASE_URL).toBe("postgres://fixture@127.0.0.1:1/fixture");

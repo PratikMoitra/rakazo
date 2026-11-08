@@ -14,6 +14,9 @@ const FIXTURE_ENV_KEYS = [
   "DB_POOL_MAX",
   "ENCRYPTION_KEY",
   "RAKAZO_DISPOSABLE_FIXTURE",
+  "RAKAZO_FIXTURE_HANDLE",
+  "RAKAZO_FIXTURE_TOKEN",
+  "RAKAZO_OWNED_FIXTURE_ID",
 ] as const;
 
 export function fixtureChildEnv(input: {
@@ -21,6 +24,9 @@ export function fixtureChildEnv(input: {
   migrationUrl: string;
   workerUrl: string;
   realtimeUrl: string;
+  handlePath: string;
+  token: string;
+  allocationId: string;
 }): NodeJS.ProcessEnv {
   return {
     PATH: process.env.PATH ?? "",
@@ -35,6 +41,9 @@ export function fixtureChildEnv(input: {
     DB_POOL_MAX: "8",
     ENCRYPTION_KEY: "phase1-fixture-encryption-key-32ch",
     RAKAZO_DISPOSABLE_FIXTURE: "1",
+    RAKAZO_FIXTURE_HANDLE: input.handlePath,
+    RAKAZO_FIXTURE_TOKEN: input.token,
+    RAKAZO_OWNED_FIXTURE_ID: input.allocationId,
   };
 }
 

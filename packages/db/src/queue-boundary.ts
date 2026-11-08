@@ -286,7 +286,9 @@ export async function provisionCredentialWorker(
   const owner = open(migrationUrl);
   await owner.connect();
   try {
-    await preflightCredentialWorker(migrationUrl, workerUrl);
+    await preflightCredentialWorker(migrationUrl, workerUrl, (config) =>
+      open(config.user === login ? workerUrl : migrationUrl),
+    );
     const secret = password ? `PASSWORD ${escapeLiteral(scramSha256Verifier(password))}` : "";
     const name = escapeIdentifier(login);
     const existing = await owner.query<{ rolcanlogin: boolean }>(

@@ -23,6 +23,9 @@ export function disposableDatabaseEnv(url: string) {
  * Image registries rate-limit shared CI runners per minute, so container pulls are retried.
  */
 export async function startPostgres(signal?: AbortSignal): Promise<DisposablePostgres> {
+  if (process.env.RAKAZO_FIXTURE_HANDLE || process.env.RAKAZO_DISPOSABLE_FIXTURE === "1") {
+    throw new Error("testkit postgres is not a phase1 fixture allocation");
+  }
   const provided = process.env.CI_POSTGRES_URL?.trim();
   if (provided) {
     return {
