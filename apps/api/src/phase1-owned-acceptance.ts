@@ -75,6 +75,8 @@ export interface OwnedProcessResult {
   code: number | null;
   output: string;
   error?: Error;
+  /** False when the process was not observed to exit. Do not delete its cluster. */
+  closed: boolean;
 }
 
 /** Starts a child in its own process group. killAndWait runs before cluster teardown. */
@@ -116,17 +118,25 @@ export function runOwnedProcess(
     reported = true;
     resolveResult(value);
   };
+  let deadline: ReturnType<typeof setTimeout> | undefined;
   const markClosed = (code: number | null) => {
     if (closed) return;
     closed = true;
     clearTimeout(timer);
+    clearTimeout(deadline);
     resolveClosed();
     report({
       code,
       output,
+      closed: true,
       ...(pendingError ? { error: pendingError } : {}),
       ...(timedOut ? { error: new Error("owned process timed out") } : {}),
     });
+  };
+  const reportUnclosed = (error: Error) => {
+    clearTimeout(timer);
+    clearTimeout(deadline);
+    report({ code: null, output, error, closed: false });
   };
   const signalFailures: unknown[] = [];
   const signalOwned = () => {
@@ -154,6 +164,14 @@ export function runOwnedProcess(
     timedOut = true;
     pendingError = new Error("owned process timed out");
     signalOwned();
+    deadline = setTimeout(() => {
+      if (closed || reported) return;
+      reportUnclosed(
+        new Error(
+          signalFailures.length ? "owned process signal failed" : "owned process did not exit",
+        ),
+      );
+    }, options.closeWaitMs ?? 1_000);
   }, options.timeoutMs ?? 120_000);
   const killAndWait = async () => {
     if (!child?.pid) {
@@ -168,6 +186,8 @@ export function runOwnedProcess(
       ),
     ]);
     if (!exited) {
+      clearTimeout(timer);
+      clearTimeout(deadline);
       throw new Error(
         signalFailures.length ? "owned process signal failed" : "owned process did not exit",
       );
@@ -183,7 +203,7 @@ export function runOwnedProcess(
     });
   } catch (error) {
     clearTimeout(timer);
-    report({ code: null, output: "", error: error as Error });
+    report({ code: null, output: "", error: error as Error, closed: true });
     resolveClosed();
     closed = true;
     return { result, killAndWait };

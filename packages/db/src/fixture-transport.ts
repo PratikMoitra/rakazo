@@ -2,6 +2,7 @@
 // The only pg Client and Pool constructors for this branch live here. Remote TLS is not implemented.
 import { createRequire } from "node:module";
 import path from "node:path";
+import type { PoolClient } from "pg";
 import { Client, Pool } from "pg";
 import { parse as parseConnectionString } from "pg-connection-string";
 import type { AllocationAuthority } from "./fixture-allocation.js";
@@ -194,11 +195,25 @@ function canonicalClientConfig(
   };
 }
 
-function bindClient(client: Client, authority: AllocationAuthority): Client {
-  const connect = client.connect.bind(client);
-  client.connect = ((...args: unknown[]) => {
-    assertCapturedAuthority(authority);
-    return connect(...(args as []));
+function bindClient(
+  client: Client,
+  authority: AllocationAuthority,
+  beforeConnect?: () => void,
+): Client {
+  const connect = Client.prototype.connect.bind(client);
+  client.connect = ((callback?: (error: Error) => void) => {
+    try {
+      assertCapturedAuthority(authority);
+      beforeConnect?.();
+    } catch (error) {
+      const failure = error instanceof Error ? error : new Error(OWNERSHIP_REFUSAL);
+      if (typeof callback === "function") {
+        queueMicrotask(() => callback(failure));
+        return;
+      }
+      return Promise.reject(failure);
+    }
+    return connect(callback as never);
   }) as Client["connect"];
   return client;
 }
@@ -272,12 +287,64 @@ export function openFixturePool(connectionString: string, options: FixturePoolOp
     idleTimeoutMillis: options.idleTimeoutMillis ?? 0,
     keepAlive: options.keepAlive ?? true,
   });
+  const canonical = canonicalClientConfig(plan, options.connectionTimeoutMillis ?? 10_000);
+  const CapturedClient = class extends Client {
+    constructor(_ignored?: unknown) {
+      super(canonical);
+      bindClient(this, authority, () => assertPoolRoute(pool, plan));
+    }
+  };
+  (pool as Pool & { Client: typeof Client }).Client = CapturedClient as unknown as typeof Client;
   poolPlans.set(pool, { plan, authority });
   const connect = pool.connect.bind(pool);
-  pool.connect = ((...args: unknown[]) => {
+  const deliver = (client: PoolClient) => {
     assertCapturedAuthority(authority);
     assertPoolRoute(pool, plan);
-    return connect(...(args as []));
+    return client;
+  };
+  const rejectCheckout = (client: PoolClient, error: unknown) => {
+    const release = (client as PoolClient & { release?: (err?: unknown) => void }).release;
+    if (release) release(error);
+    else void client.end().catch(() => undefined);
+  };
+  pool.connect = ((callback?: unknown) => {
+    try {
+      assertCapturedAuthority(authority);
+      assertPoolRoute(pool, plan);
+    } catch (error) {
+      if (typeof callback === "function") {
+        queueMicrotask(() => callback(error));
+        return;
+      }
+      return Promise.reject(error);
+    }
+    if (typeof callback === "function") {
+      return connect(
+        (error: Error | undefined, client: PoolClient | undefined, done: (err?: unknown) => void) => {
+          if (!error && client) {
+            try {
+              deliver(client);
+            } catch (refusal) {
+              try {
+                done(refusal);
+              } catch {
+                rejectCheckout(client, refusal);
+              }
+              return callback(refusal);
+            }
+          }
+          return callback(error, client, done);
+        },
+      );
+    }
+    return connect().then((client) => {
+      try {
+        return deliver(client);
+      } catch (error) {
+        rejectCheckout(client, error);
+        throw error;
+      }
+    });
   }) as Pool["connect"];
   return pool;
 }
@@ -362,10 +429,12 @@ const ENGINE_EXTRA_REFUSAL = "migration engine environment refuses a protected o
 export function fixtureEngineEnv(
   engineUrl: string,
   extra: { RAKAZO_MIGRATIONS_PATH?: string } = {},
+  authority?: AllocationAuthority,
 ): NodeJS.ProcessEnv {
   for (const key of Object.keys(extra)) {
     if (key !== "RAKAZO_MIGRATIONS_PATH") throw new Error(ENGINE_EXTRA_REFUSAL);
   }
+  if (authority) assertCapturedAuthority(authority);
   const env: NodeJS.ProcessEnv = {};
   for (const key of ENGINE_ENV_ALLOW) {
     const value = process.env[key];
@@ -374,9 +443,11 @@ export function fixtureEngineEnv(
   env.DATABASE_URL = engineUrl;
   env.DATABASE_MIGRATION_URL = engineUrl;
   env.RAKAZO_DISPOSABLE_FIXTURE = "1";
-  if (process.env.RAKAZO_FIXTURE_HANDLE)
-    env.RAKAZO_FIXTURE_HANDLE = process.env.RAKAZO_FIXTURE_HANDLE;
-  if (process.env.RAKAZO_FIXTURE_TOKEN) env.RAKAZO_FIXTURE_TOKEN = process.env.RAKAZO_FIXTURE_TOKEN;
+  if (authority) {
+    env.RAKAZO_FIXTURE_HANDLE = authority.path;
+    env.RAKAZO_FIXTURE_TOKEN = authority.token;
+    env.RAKAZO_OWNED_FIXTURE_ID = authority.id;
+  }
   if (extra.RAKAZO_MIGRATIONS_PATH !== undefined) {
     env.RAKAZO_MIGRATIONS_PATH = extra.RAKAZO_MIGRATIONS_PATH;
   }

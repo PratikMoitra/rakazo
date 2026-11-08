@@ -114,6 +114,29 @@ it("rejects a raw Prisma config that only has a fake handle", async () => {
   expect(ambient.code).toBe(1);
   expect(ambient.output).toContain("database target is not an owned fixture allocation");
 
-  const generate = await run([loader, "generate"], baseEnv({}));
+  const generate = await run([loader], baseEnv({ RAKAZO_CONFIG_ARGV: "generate" }));
   expect(generate.code).toBe(0);
+
+  const operand = await run(
+    [loader],
+    baseEnv({
+      RAKAZO_CONFIG_ARGV: "migrate resolve --applied generate",
+      DATABASE_URL: "postgres://ambient:ambient@203.0.113.10/preserved",
+      DATABASE_MIGRATION_URL: "postgres://ambient:ambient@203.0.113.10/preserved",
+    }),
+  );
+  expect(operand.code).toBe(1);
+  expect(operand.output).toContain("database target is not an owned fixture allocation");
+
+  const named = await run(
+    [loader],
+    baseEnv({
+      RAKAZO_CONFIG_ARGV: "migrate dev --name generate",
+      DATABASE_MIGRATION_URL:
+        "postgres://fixture:secret@203.0.113.10:6543/db?host=127.0.0.1&port=9",
+      RAKAZO_DISPOSABLE_FIXTURE: "1",
+    }),
+  );
+  expect(named.code).toBe(1);
+  expect(named.output).not.toContain("fixture migration delegation accepted");
 });

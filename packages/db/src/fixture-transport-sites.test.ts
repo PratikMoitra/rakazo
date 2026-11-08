@@ -72,7 +72,7 @@ describe("fixture transport use sites", () => {
     expect(filesUnder("packages/db/src")).toContain(CONSTRUCTOR_FILE);
     const delegated = [
       ["packages/db/package.json", "fixture-migrate-cli"],
-      ["packages/db/prisma.config.ts", "assertMutatingDatasource"],
+      ["packages/db/prisma.config.ts", "canonicalMutatingDatasource"],
       ["packages/db/src/deferred-migrations.ts", "pinnedPrismaCli"],
       ["packages/testkit/src/cli/postgres.ts", "not a phase1 fixture allocation"],
     ] as const;
@@ -151,7 +151,9 @@ describe("fixture transport use sites", () => {
     const { mkdirSync } = await import("node:fs");
     mkdirSync(migration);
     writeFileSync(path.join(migration, "migration.sql"), "-- deferred\nSELECT 1;\n");
-    await expect(heldBackMigrations(remote, directory)).rejects.toThrow(PLAINTEXT_REFUSAL);
+    await expect(heldBackMigrations(remote, directory)).rejects.toThrow(
+      /owned fixture|literal loopback/,
+    );
     rmSync(directory, { recursive: true, force: true });
   });
 });

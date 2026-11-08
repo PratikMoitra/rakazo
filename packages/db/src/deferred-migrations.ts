@@ -3,6 +3,7 @@ import { cpSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { Client } from "pg";
+import type { AllocationAuthority } from "./fixture-allocation.js";
 import { assertCapturedAuthority, captureAllocationAuthority } from "./fixture-allocation.js";
 import {
   fixtureConnectionPlan,
@@ -39,6 +40,7 @@ export async function heldBackMigrations(
   migrationUrl: string,
   migrationsDir: string,
   previousMigrations?: readonly string[],
+  authority?: AllocationAuthority,
 ): Promise<string[]> {
   const deferred = readdirSync(migrationsDir, { withFileTypes: true })
     .filter(
@@ -50,8 +52,7 @@ export async function heldBackMigrations(
     )
     .map((entry) => entry.name);
   if (deferred.length === 0) return [];
-  fixtureConnectionPlan(migrationUrl);
-  const client = openFixtureClient(migrationUrl);
+  const client = openOwnedClient(migrationUrl, authority);
   await client.connect();
   try {
     const done = await appliedMigrations(client);
@@ -76,9 +77,12 @@ export async function heldBackMigrations(
   }
 }
 
-async function forgetHeldBack(migrationUrl: string, names: string[]) {
-  fixtureConnectionPlan(migrationUrl);
-  const client = openFixtureClient(migrationUrl);
+async function forgetHeldBack(
+  migrationUrl: string,
+  names: string[],
+  authority?: AllocationAuthority,
+) {
+  const client = openOwnedClient(migrationUrl, authority);
   await client.connect();
   try {
     await client.query('DELETE FROM "_deferred_migrations" WHERE name = ANY($1)', [names]);
@@ -95,9 +99,12 @@ const LOCK_TIMEOUT_MS = 5_000;
  * Whether a migration this run applies builds an index concurrently. Such a build waits for every
  * open transaction to finish, which a lock timeout would cancel.
  */
-async function buildsIndexConcurrently(migrationUrl: string, migrationsPath: string) {
-  fixtureConnectionPlan(migrationUrl);
-  const client = openFixtureClient(migrationUrl);
+async function buildsIndexConcurrently(
+  migrationUrl: string,
+  migrationsPath: string,
+  authority?: AllocationAuthority,
+) {
+  const client = openOwnedClient(migrationUrl, authority);
   await client.connect();
   try {
     const done = (await appliedMigrations(client)) ?? new Set<string>();
@@ -125,9 +132,19 @@ const LOCK_RETRY_DELAYS_MS = [2_000, 10_000];
  * Marks the failed migration rolled back when it lost a lock to live traffic (a deadlock or lock
  * timeout) and ran as one transaction, so nothing of it stayed applied and running it again is safe.
  */
-async function rollBackLockConflict(migrationUrl: string, migrationsPath: string) {
-  fixtureConnectionPlan(migrationUrl);
-  const client = openFixtureClient(migrationUrl);
+function openOwnedClient(migrationUrl: string, authority?: AllocationAuthority) {
+  if (authority) assertCapturedAuthority(authority);
+  return authority
+    ? openFixtureClient(migrationUrl, {}, authority)
+    : openFixtureClient(migrationUrl);
+}
+
+async function rollBackLockConflict(
+  migrationUrl: string,
+  migrationsPath: string,
+  authority?: AllocationAuthority,
+) {
+  const client = openOwnedClient(migrationUrl, authority);
   await client.connect();
   try {
     const { rows } = await client.query<{
@@ -179,6 +196,7 @@ export async function deployMigrations(input: {
     input.migrationUrl,
     migrationsDir,
     input.previousMigrations,
+    authority,
   );
   let migrationsPath = migrationsDir;
   if (held.length) {
@@ -190,18 +208,17 @@ export async function deployMigrations(input: {
     process.stdout.write(`Holding back until the next migration run: ${held.join(", ")}\n`);
   }
   try {
-    const concurrent = await buildsIndexConcurrently(input.migrationUrl, migrationsPath);
-    assertCapturedAuthority(authority);
-    const deployUrl = concurrent
-      ? fixtureEngineUrl(input.migrationUrl, undefined, authority)
-      : fixtureEngineUrl(input.migrationUrl, input.lockTimeoutMs ?? LOCK_TIMEOUT_MS, authority);
-    assertCapturedAuthority(authority);
+    const concurrent = await buildsIndexConcurrently(input.migrationUrl, migrationsPath, authority);
     for (let attempt = 0; ; attempt++) {
+      assertCapturedAuthority(authority);
+      const deployUrl = concurrent
+        ? fixtureEngineUrl(input.migrationUrl, undefined, authority)
+        : fixtureEngineUrl(input.migrationUrl, input.lockTimeoutMs ?? LOCK_TIMEOUT_MS, authority);
       try {
         (input.spawn ?? execFileSync)(process.execPath, [pinnedPrismaCli(), "migrate", "deploy"], {
           cwd: input.dbPackageDir,
           stdio: "inherit",
-          env: fixtureEngineEnv(deployUrl, { RAKAZO_MIGRATIONS_PATH: migrationsPath }),
+          env: fixtureEngineEnv(deployUrl, { RAKAZO_MIGRATIONS_PATH: migrationsPath }, authority),
         });
         break;
       } catch (error) {
@@ -209,7 +226,9 @@ export async function deployMigrations(input: {
         const retried =
           delay === undefined
             ? undefined
-            : await rollBackLockConflict(input.migrationUrl, migrationsPath).catch(() => undefined);
+            : await rollBackLockConflict(input.migrationUrl, migrationsPath, authority).catch(
+                () => undefined,
+              );
         if (!retried) throw error;
         process.stdout.write(`${retried} lost a lock to running queries; retrying\n`);
         await new Promise((resolve) => setTimeout(resolve, delay));
@@ -217,7 +236,7 @@ export async function deployMigrations(input: {
     }
   } catch (error) {
     // A failed run may leave the previous release running, so the hold lasts until a run succeeds.
-    if (held.length) await forgetHeldBack(input.migrationUrl, held);
+    if (held.length) await forgetHeldBack(input.migrationUrl, held, authority);
     throw error;
   } finally {
     if (migrationsPath !== migrationsDir) rmSync(migrationsPath, { recursive: true, force: true });

@@ -4,6 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { Socket } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { Client } from "pg";
 import { afterEach, expect, it } from "vitest";
 import {
   beginFixtureClose,
@@ -126,4 +127,72 @@ it("rejects a connectionString override and still reaches connect for an unchang
   revokeFixtureAllocation(owned.handle);
   restoreEnv(owned.previous);
   rmSync(owned.root, { recursive: true, force: true });
+});
+
+it("does not connect a queued checkout after revocation, replacement, or route mutation", async () => {
+  denySockets();
+  const original = Client.prototype.connect;
+  let simulated = false;
+  Client.prototype.connect = function connect(this: Client, callback?: (error?: Error) => void) {
+    if (!simulated) {
+      simulated = true;
+      (this as Client & { _queryable?: boolean })._queryable = true;
+      if (typeof callback === "function") {
+        queueMicrotask(() => callback());
+        return;
+      }
+      return Promise.resolve();
+    }
+    return original.call(this, callback as never);
+  } as Client["connect"];
+  const owned = allocation();
+  const pool = openFixturePool(url, {
+    max: 1,
+    connectionTimeoutMillis: 1000,
+    idleTimeoutMillis: 0,
+  });
+  try {
+    const first = await pool.connect();
+    const queued = pool.connect();
+    beginFixtureClose(owned.handle);
+    (first as Client & { release: (error?: Error) => void }).release(new Error("replaced"));
+    await expect(queued).rejects.toThrow(/owned fixture|stale|approved fixture plan/);
+    expect(sockets.count).toBe(0);
+
+    const again = allocation();
+    const pool2 = openFixturePool(url, { max: 1, idleTimeoutMillis: 0 });
+    simulated = false;
+    const held = await pool2.connect();
+    const waiting = pool2.connect();
+    pool2.options.connectionString = "postgres://fixture:secret@203.0.113.10:9/db";
+    (held as Client & { release: (error?: Error) => void }).release(new Error("replaced"));
+    await expect(waiting).rejects.toThrow(/approved fixture plan/);
+    expect(sockets.count).toBe(0);
+    simulated = false;
+    const poolSsl = openFixturePool(url, { max: 1, idleTimeoutMillis: 0 });
+    const heldSsl = await poolSsl.connect();
+    const waitingSsl = poolSsl.connect();
+    poolSsl.options.ssl = { rejectUnauthorized: false };
+    (heldSsl as Client & { release: (error?: Error) => void }).release(new Error("replaced"));
+    await expect(waitingSsl).rejects.toThrow(/approved fixture plan/);
+    expect(sockets.count).toBe(0);
+
+    const pool3 = openFixturePool(url, { max: 1, idleTimeoutMillis: 0 });
+    simulated = false;
+    const idle = await pool3.connect();
+    const reused = pool3.connect();
+    beginFixtureClose(again.handle);
+    (idle as Client & { release: () => void }).release();
+    await expect(reused).rejects.toThrow(/owned fixture|stale/);
+    expect(sockets.count).toBe(0);
+    again.release();
+    revokeFixtureAllocation(again.handle);
+    restoreEnv(again.previous);
+    rmSync(again.root, { recursive: true, force: true });
+  } finally {
+    Client.prototype.connect = original;
+    owned.release();
+    restoreEnv(owned.previous);
+    rmSync(owned.root, { recursive: true, force: true });
+  }
 });

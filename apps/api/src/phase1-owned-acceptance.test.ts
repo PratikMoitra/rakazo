@@ -174,3 +174,32 @@ it("reports a failed signal without treating the child as closed", async () => {
   child.emit("error", new Error("still running"));
   await expect(owned.killAndWait()).rejects.toThrow(/signal failed/);
 });
+
+it("rejects the awaited result when timeout signals fail and close never arrives", async () => {
+  const child = new EventEmitter() as ChildProcess & EventEmitter;
+  child.stdout = new EventEmitter() as ChildProcess["stdout"];
+  child.stderr = new EventEmitter() as ChildProcess["stderr"];
+  Object.defineProperty(child, "pid", { value: 717171 });
+  child.kill = () => {
+    throw new Error("kill failed");
+  };
+  let removed = false;
+  const owned = runOwnedProcess(
+    "sleep",
+    [],
+    {},
+    {
+      timeoutMs: 15,
+      closeWaitMs: 20,
+      signalProcess: () => {
+        throw new Error("signal failed");
+      },
+      spawn: () => child,
+    },
+  );
+  const result = await owned.result;
+  expect(result.closed).toBe(false);
+  expect(result.error?.message).toMatch(/signal failed|did not exit/);
+  if (result.closed) removed = true;
+  expect(removed).toBe(false);
+});
