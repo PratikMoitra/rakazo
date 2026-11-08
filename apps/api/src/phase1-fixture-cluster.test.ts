@@ -1,10 +1,21 @@
 // Phase-1 addition for the isolated workspace slice. Apache-2.0; see LICENSE. Not an upstream Rakazo file.
+import { mkdirSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+  fixtureConnectionPlan,
+  publishFixtureHandle,
+  registerFixtureAllocation,
+  restoreEnv,
+} from "@rakazo/db";
 import { expect, it } from "vitest";
 import type { FixtureCommandResult } from "./phase1-fixture-cluster.js";
-import { cleanupFixtureDataDirectory, startFixtureCluster } from "./phase1-fixture-cluster.js";
+import {
+  cleanupFixtureDataDirectory,
+  createFixtureStopController,
+  startFixtureCluster,
+} from "./phase1-fixture-cluster.js";
 
 function command(result: FixtureCommandResult) {
   return async () => result;
@@ -79,5 +90,55 @@ it("preserves the data directory when stop leaves the server running", async () 
     }),
   ).rejects.toThrow(/stop uncertain/);
   expect(removed).toEqual([]);
+  await rm(root, { recursive: true, force: true });
+});
+
+it("drops allocation authority when stop starts and does not treat status 4 as stopped", async () => {
+  const root = await mkdtemp(join(tmpdir(), "phase1-stop-"));
+  const data = join(root, "data");
+  mkdirSync(data);
+  const handle = registerFixtureAllocation({
+    host: "127.0.0.1",
+    port: 9,
+    database: "postgres",
+    users: ["fixture_admin"],
+    dataDirectory: data,
+    root,
+  });
+  const previous = {
+    RAKAZO_DISPOSABLE_FIXTURE: process.env.RAKAZO_DISPOSABLE_FIXTURE,
+    RAKAZO_FIXTURE_HANDLE: process.env.RAKAZO_FIXTURE_HANDLE,
+    RAKAZO_FIXTURE_TOKEN: process.env.RAKAZO_FIXTURE_TOKEN,
+    RAKAZO_OWNED_FIXTURE_ID: process.env.RAKAZO_OWNED_FIXTURE_ID,
+  };
+  const release = publishFixtureHandle(handle);
+  const removed: string[] = [];
+  let statusCode = 4;
+  const controller = createFixtureStopController({
+    handle,
+    data,
+    root,
+    remove: async (path) => {
+      removed.push(path);
+      throw new Error("remove failed");
+    },
+    run: async (_command, args) => {
+      if (args.includes("status")) return { code: statusCode, stdout: "", stderr: "" };
+      return { code: 0, stdout: "", stderr: "" };
+    },
+  });
+  await expect(controller.stop()).rejects.toThrow(/status exit 4/);
+  expect(removed).toEqual([]);
+  expect(() =>
+    fixtureConnectionPlan("postgres://fixture_admin:secret@127.0.0.1:9/postgres"),
+  ).toThrow(/owned fixture/);
+  await expect(controller.stop()).rejects.toThrow(/status exit 4/);
+  statusCode = 3;
+  await expect(controller.stop()).rejects.toThrow(/remove failed/);
+  expect(removed).toEqual([root]);
+  await expect(controller.stop()).rejects.toThrow(/remove failed/);
+  expect(removed).toEqual([root, root]);
+  release();
+  restoreEnv(previous);
   await rm(root, { recursive: true, force: true });
 });

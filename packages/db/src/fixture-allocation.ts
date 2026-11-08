@@ -13,6 +13,8 @@ const LIVE = new Map<string, FixtureAllocation>();
 export interface FixtureAllocation {
   id: string;
   token: string;
+  generation: number;
+  state: "open" | "closing";
   host: string;
   port: number;
   database: string;
@@ -21,6 +23,14 @@ export interface FixtureAllocation {
   dataDirectory: string;
   root: string;
   path: string;
+}
+
+/** Identity captured when a client or pool is created. Later env changes do not replace it. */
+export interface AllocationAuthority {
+  id: string;
+  generation: number;
+  path: string;
+  token: string;
 }
 
 export interface FixtureHandle {
@@ -58,6 +68,7 @@ export function registerFixtureAllocation(input: {
     throw new Error(OWNERSHIP_REFUSAL);
   }
   for (const existing of LIVE.values()) {
+    if (existing.state !== "open") continue;
     if (existing.host === input.host && existing.port === input.port)
       throw new Error(REUSE_REFUSAL);
   }
@@ -67,6 +78,8 @@ export function registerFixtureAllocation(input: {
     host: input.host,
     port: input.port,
     database: input.database,
+    generation: 1,
+    state: "open",
     databases: [input.database],
     users: [...new Set(input.users)],
     dataDirectory: input.dataDirectory,
@@ -90,6 +103,28 @@ export function allowFixtureIdentity(
   }
   writeAllocation(allocation);
   LIVE.set(allocation.id, allocation);
+}
+
+/** Drops authority immediately. A later stop or removal failure cannot bring it back. */
+export function beginFixtureClose(handle: FixtureHandle): void {
+  const current = liveOrFile(handle);
+  if (!current || current.state === "closing") return;
+  current.state = "closing";
+  current.generation += 1;
+  writeAllocation(current);
+  LIVE.set(current.id, current);
+}
+
+function liveOrFile(handle: FixtureHandle): FixtureAllocation | undefined {
+  const current = LIVE.get(handle.id);
+  if (current) return current.token === handle.token ? current : undefined;
+  try {
+    const parsed = JSON.parse(readFileSync(handle.path, "utf8")) as FixtureAllocation;
+    if (parsed.id !== handle.id || parsed.token !== handle.token) return undefined;
+    return parsed;
+  } catch {
+    return undefined;
+  }
 }
 
 export function revokeFixtureAllocation(handle: FixtureHandle): void {
@@ -133,15 +168,64 @@ function readAuthorized(handlePath: string, token: string, expectedId?: string):
   } catch {
     throw new Error(OWNERSHIP_REFUSAL);
   }
-  if (!parsed || parsed.token !== token || !parsed.id || !parsed.dataDirectory) {
+  if (
+    !parsed ||
+    parsed.token !== token ||
+    !parsed.id ||
+    !parsed.dataDirectory ||
+    parsed.state !== "open" ||
+    !Number.isInteger(parsed.generation)
+  ) {
     throw new Error(OWNERSHIP_REFUSAL);
   }
   if (expectedId && expectedId !== parsed.id) throw new Error(OWNERSHIP_REFUSAL);
   const memory = LIVE.get(parsed.id);
-  if (memory && memory.token !== parsed.token) throw new Error(OWNERSHIP_REFUSAL);
+  if (
+    memory &&
+    (memory.token !== parsed.token ||
+      memory.state !== "open" ||
+      memory.generation !== parsed.generation)
+  ) {
+    throw new Error(OWNERSHIP_REFUSAL);
+  }
   if (!existsSync(parsed.dataDirectory)) throw new Error(STALE_REFUSAL);
   if (!literalHost(parsed.host)) throw new Error(OWNERSHIP_REFUSAL);
   return parsed;
+}
+
+export function captureAllocationAuthority(
+  env: NodeJS.ProcessEnv = process.env,
+): AllocationAuthority {
+  const allocation = currentFixtureAllocation(env);
+  return {
+    id: allocation.id,
+    generation: allocation.generation,
+    path: allocation.path,
+    token: allocation.token,
+  };
+}
+
+/** Revalidates the authority captured at creation. It does not read the current env handle. */
+export function assertCapturedAuthority(authority: AllocationAuthority): void {
+  let parsed: FixtureAllocation;
+  try {
+    parsed = JSON.parse(readFileSync(authority.path, "utf8")) as FixtureAllocation;
+  } catch {
+    throw new Error(OWNERSHIP_REFUSAL);
+  }
+  if (
+    parsed.id !== authority.id ||
+    parsed.token !== authority.token ||
+    parsed.generation !== authority.generation ||
+    parsed.state !== "open"
+  ) {
+    throw new Error(OWNERSHIP_REFUSAL);
+  }
+  const memory = LIVE.get(authority.id);
+  if (memory && (memory.state !== "open" || memory.generation !== authority.generation)) {
+    throw new Error(OWNERSHIP_REFUSAL);
+  }
+  if (!existsSync(parsed.dataDirectory)) throw new Error(STALE_REFUSAL);
 }
 
 export function assertAllocationMatches(

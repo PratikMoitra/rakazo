@@ -262,8 +262,12 @@ describe("owned fixture transport refuses before I/O", () => {
     expect(env.PGSSLMODE).toBeUndefined();
     expect(env.NODE_OPTIONS).toBeUndefined();
     expect(env.PRISMA_SCHEMA_ENGINE_BINARY).toBeUndefined();
-    expect(() => fixtureEngineEnv(ipv4, { DATABASE_URL: remote })).toThrow(/protected override/);
-    expect(() => fixtureEngineEnv(ipv4, { PGHOST: "203.0.113.10" })).toThrow(/protected override/);
+    expect(() =>
+      fixtureEngineEnv(ipv4, { DATABASE_URL: remote } as { RAKAZO_MIGRATIONS_PATH?: string }),
+    ).toThrow(/protected override/);
+    expect(() =>
+      fixtureEngineEnv(ipv4, { PGHOST: "203.0.113.10" } as { RAKAZO_MIGRATIONS_PATH?: string }),
+    ).toThrow(/protected override/);
     expectNoIo();
   });
 

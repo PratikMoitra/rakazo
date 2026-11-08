@@ -72,7 +72,7 @@ describe("fixture transport use sites", () => {
     expect(filesUnder("packages/db/src")).toContain(CONSTRUCTOR_FILE);
     const delegated = [
       ["packages/db/package.json", "fixture-migrate-cli"],
-      ["packages/db/prisma.config.ts", "unowned database url"],
+      ["packages/db/prisma.config.ts", "assertMutatingDatasource"],
       ["packages/db/src/deferred-migrations.ts", "pinnedPrismaCli"],
       ["packages/testkit/src/cli/postgres.ts", "not a phase1 fixture allocation"],
     ] as const;
@@ -109,7 +109,7 @@ describe("fixture transport use sites", () => {
     expect(() => createPool(remote)).toThrow(PLAINTEXT_REFUSAL);
     await expect(
       deployMigrations({ migrationUrl: remote, dbPackageDir: repoRoot }),
-    ).rejects.toThrow(PLAINTEXT_REFUSAL);
+    ).rejects.toThrow(/owned fixture|literal loopback/);
     expect(opened).toBe(0);
   });
 

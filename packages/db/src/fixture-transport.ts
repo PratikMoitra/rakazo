@@ -4,7 +4,13 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import { Client, Pool } from "pg";
 import { parse as parseConnectionString } from "pg-connection-string";
-import { assertAllocationMatches } from "./fixture-allocation.js";
+import type { AllocationAuthority } from "./fixture-allocation.js";
+import {
+  assertAllocationMatches,
+  assertCapturedAuthority,
+  captureAllocationAuthority,
+  OWNERSHIP_REFUSAL,
+} from "./fixture-allocation.js";
 
 /** Query keys that cannot change the host, port, database, login, password, socket, or TLS. */
 const BENIGN_PG_QUERY_KEYS = new Set(["application_name", "connect_timeout"]);
@@ -15,7 +21,10 @@ export const OPTIONS_REFUSAL = "DATABASE_WORKER_URL startup options are not expl
 export const PLAINTEXT_REFUSAL =
   "plaintext database transport requires an explicit disposable fixture on literal loopback";
 const LITERAL_LOOPBACK = new Set(["127.0.0.1", "::1"]);
-const poolPlans = new WeakMap<Pool, FixtureConnectionPlan>();
+const poolPlans = new WeakMap<
+  Pool,
+  { plan: FixtureConnectionPlan; authority: AllocationAuthority }
+>();
 const require = createRequire(import.meta.url);
 
 /**
@@ -169,13 +178,11 @@ export function assertFixtureDatabaseEnv(env: NodeJS.ProcessEnv): void {
   fixtureConnectionPlan(env.DATABASE_WORKER_URL.trim());
 }
 
-export function openExplicitClient(
-  config: ExplicitPgConfig,
+function canonicalClientConfig(
+  fields: ExplicitPgConfig & { password: string },
   connectionTimeoutMillis?: number,
-): Client {
-  const fields = explicitWorkerClientConfig(config);
-  assertAllocationMatches(fields);
-  const approved = {
+) {
+  return {
     host: fields.host,
     port: fields.port,
     database: fields.database,
@@ -185,7 +192,31 @@ export function openExplicitClient(
     ssl: false as const,
     ...(connectionTimeoutMillis === undefined ? {} : { connectionTimeoutMillis }),
   };
-  return new Client(approved);
+}
+
+function bindClient(client: Client, authority: AllocationAuthority): Client {
+  const connect = client.connect.bind(client);
+  client.connect = ((...args: unknown[]) => {
+    assertCapturedAuthority(authority);
+    return connect(...(args as []));
+  }) as Client["connect"];
+  return client;
+}
+
+export function openExplicitClient(
+  config: ExplicitPgConfig,
+  connectionTimeoutMillis?: number,
+): Client {
+  const fields = explicitWorkerClientConfig(config);
+  assertAllocationMatches(fields);
+  if (!fields.password) throw new Error(ENDPOINT_REFUSAL);
+  const authority = captureAllocationAuthority();
+  return bindClient(
+    new Client(
+      canonicalClientConfig({ ...fields, password: fields.password }, connectionTimeoutMillis),
+    ),
+    authority,
+  );
 }
 
 export interface FixtureClientOptions {
@@ -197,20 +228,23 @@ export interface FixtureClientOptions {
 export function openFixtureClient(
   connectionString: string,
   options: FixtureClientOptions = {},
+  authority: AllocationAuthority = captureAllocationAuthority(),
 ): Client {
   const plan = fixtureConnectionPlan(connectionString);
-  return new Client({
-    host: plan.host,
-    port: plan.port,
-    database: plan.database,
-    user: plan.user,
-    password: plan.password,
-    application_name: options.applicationName ?? plan.application_name,
-    ssl: false,
-    ...(options.connectionTimeoutMillis === undefined
-      ? {}
-      : { connectionTimeoutMillis: options.connectionTimeoutMillis }),
-  });
+  const current = captureAllocationAuthority();
+  if (current.id !== authority.id || current.generation !== authority.generation) {
+    throw new Error(OWNERSHIP_REFUSAL);
+  }
+  assertCapturedAuthority(authority);
+  return bindClient(
+    new Client(
+      canonicalClientConfig(
+        { ...plan, application_name: options.applicationName ?? plan.application_name },
+        options.connectionTimeoutMillis,
+      ),
+    ),
+    authority,
+  );
 }
 
 export interface FixturePoolOptions {
@@ -224,6 +258,7 @@ export interface FixturePoolOptions {
 /** Opens a pool from the plan and marks it so Graphile can refuse a raw pool. */
 export function openFixturePool(connectionString: string, options: FixturePoolOptions = {}): Pool {
   const plan = fixtureConnectionPlan(connectionString);
+  const authority = captureAllocationAuthority();
   const pool = new Pool({
     host: plan.host,
     port: plan.port,
@@ -237,41 +272,55 @@ export function openFixturePool(connectionString: string, options: FixturePoolOp
     idleTimeoutMillis: options.idleTimeoutMillis ?? 0,
     keepAlive: options.keepAlive ?? true,
   });
-  poolPlans.set(pool, plan);
+  poolPlans.set(pool, { plan, authority });
   const connect = pool.connect.bind(pool);
   pool.connect = ((...args: unknown[]) => {
+    assertCapturedAuthority(authority);
     assertPoolRoute(pool, plan);
     return connect(...(args as []));
   }) as Pool["connect"];
   return pool;
 }
 
+const ROUTE_REFUSAL = "database pool no longer matches its approved fixture plan";
+
 function assertPoolRoute(pool: Pool, plan: FixtureConnectionPlan): void {
   const options = pool.options;
+  if (!options || options.connectionString || options.ssl !== false) throw new Error(ROUTE_REFUSAL);
+  if ("options" in options && options.options) throw new Error(ROUTE_REFUSAL);
   if (
-    !options ||
     options.host !== plan.host ||
     Number(options.port) !== plan.port ||
     options.database !== plan.database ||
-    options.user !== plan.user ||
-    options.ssl !== false
+    options.user !== plan.user
   ) {
-    throw new Error("database pool no longer matches its approved fixture plan");
+    throw new Error(ROUTE_REFUSAL);
   }
 }
 
 export function assertApprovedPool(pool: Pool): void {
-  const plan = poolPlans.get(pool);
-  if (!plan) throw new Error("database pool was not opened by the disposable fixture transport");
-  assertPoolRoute(pool, plan);
+  const approved = poolPlans.get(pool);
+  if (!approved)
+    throw new Error("database pool was not opened by the disposable fixture transport");
+  assertCapturedAuthority(approved.authority);
+  assertPoolRoute(pool, approved.plan);
 }
 
 /**
  * URL rebuilt from the plan for the external migration engine. User query options are not copied.
  * lockTimeoutMs is the internal lock timeout only.
  */
-export function fixtureEngineUrl(connectionString: string, lockTimeoutMs?: number): string {
+export function fixtureEngineUrl(
+  connectionString: string,
+  lockTimeoutMs?: number,
+  authority: AllocationAuthority = captureAllocationAuthority(),
+): string {
   const plan = fixtureConnectionPlan(connectionString);
+  assertCapturedAuthority(authority);
+  const current = captureAllocationAuthority();
+  if (current.id !== authority.id || current.generation !== authority.generation) {
+    throw new Error(OWNERSHIP_REFUSAL);
+  }
   if (
     lockTimeoutMs !== undefined &&
     (!Number.isInteger(lockTimeoutMs) || lockTimeoutMs < 1 || lockTimeoutMs > 600_000)
@@ -312,21 +361,10 @@ const ENGINE_EXTRA_REFUSAL = "migration engine environment refuses a protected o
 /** Minimal child environment. Caller extras cannot replace the approved URL or routing settings. */
 export function fixtureEngineEnv(
   engineUrl: string,
-  extra: Record<string, string | undefined> = {},
+  extra: { RAKAZO_MIGRATIONS_PATH?: string } = {},
 ): NodeJS.ProcessEnv {
   for (const key of Object.keys(extra)) {
-    if (
-      key.startsWith("PG") ||
-      key.startsWith("PRISMA_") ||
-      key.startsWith("DATABASE_") ||
-      key === "NODE_OPTIONS" ||
-      key === "NODE_PATH" ||
-      key === "REALTIME_DATABASE_URL" ||
-      key === "DOTENV_CONFIG_PATH" ||
-      key === "PATH"
-    ) {
-      throw new Error(ENGINE_EXTRA_REFUSAL);
-    }
+    if (key !== "RAKAZO_MIGRATIONS_PATH") throw new Error(ENGINE_EXTRA_REFUSAL);
   }
   const env: NodeJS.ProcessEnv = {};
   for (const key of ENGINE_ENV_ALLOW) {
@@ -339,8 +377,8 @@ export function fixtureEngineEnv(
   if (process.env.RAKAZO_FIXTURE_HANDLE)
     env.RAKAZO_FIXTURE_HANDLE = process.env.RAKAZO_FIXTURE_HANDLE;
   if (process.env.RAKAZO_FIXTURE_TOKEN) env.RAKAZO_FIXTURE_TOKEN = process.env.RAKAZO_FIXTURE_TOKEN;
-  for (const [key, value] of Object.entries(extra)) {
-    if (value !== undefined) env[key] = value;
+  if (extra.RAKAZO_MIGRATIONS_PATH !== undefined) {
+    env.RAKAZO_MIGRATIONS_PATH = extra.RAKAZO_MIGRATIONS_PATH;
   }
   return env;
 }

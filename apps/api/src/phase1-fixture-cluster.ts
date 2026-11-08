@@ -6,7 +6,8 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type FixtureHandle, registerFixtureAllocation, revokeFixtureAllocation } from "@rakazo/db";
+import type { FixtureHandle } from "@rakazo/db";
+import { beginFixtureClose, registerFixtureAllocation, revokeFixtureAllocation } from "@rakazo/db";
 
 const BIN = "/usr/lib/postgresql/16/bin";
 /** pg_ctl status exit when this data directory has no running server. */
@@ -75,15 +76,43 @@ export async function startFixtureCluster(
     return {
       url,
       handle,
-      stop: async () => {
-        await cleanupFixtureDataDirectory({ data, root, startAttempted: true, run, remove });
-        revokeFixtureAllocation(handle);
-      },
+      stop: createFixtureStopController({ handle, data, root, run, remove }).stop,
     };
   } catch (error) {
     await cleanupFixtureDataDirectory({ data, root, startAttempted, run, remove });
     throw error;
   }
+}
+
+/**
+ * Authority ends when stop starts. Repeated calls retry only the phase that failed.
+ * pg_ctl status 3 is the only confirmed-stopped code. Any other code, including 4, is not.
+ */
+export function createFixtureStopController(input: {
+  handle: FixtureHandle;
+  data: string;
+  root: string;
+  run: FixtureCommandRunner;
+  remove: (path: string) => Promise<void>;
+}): { stop: () => Promise<void> } {
+  const progress = { confirmed: false, removed: false };
+  return {
+    stop: async () => {
+      beginFixtureClose(input.handle);
+      if (progress.removed) return;
+      if (!progress.confirmed) {
+        await input.run(join(BIN, "pg_ctl"), ["-D", input.data, "-m", "immediate", "stop"]);
+        const status = await input.run(join(BIN, "pg_ctl"), ["-D", input.data, "status"]);
+        if (status.code !== SERVER_NOT_RUNNING) {
+          throw new Error(`fixture server stop uncertain: status exit ${status.code}`);
+        }
+        progress.confirmed = true;
+      }
+      await input.remove(input.root);
+      progress.removed = true;
+      revokeFixtureAllocation(input.handle);
+    },
+  };
 }
 
 export async function cleanupFixtureDataDirectory(input: {

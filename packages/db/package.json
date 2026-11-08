@@ -12,8 +12,8 @@
   },
   "scripts": {
     "generate": "prisma generate",
-    "migrate": "node --experimental-strip-types src/fixture-migrate-cli.ts",
-    "migrate:dev": "node --experimental-strip-types src/fixture-migrate-cli.ts --dev",
+    "migrate": "tsx src/fixture-migrate-cli.ts",
+    "migrate:dev": "tsx src/fixture-migrate-cli.ts --dev",
     "check": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run --root ../.. packages/db/src"
   },

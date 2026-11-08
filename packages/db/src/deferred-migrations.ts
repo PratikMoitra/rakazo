@@ -3,6 +3,7 @@ import { cpSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { Client } from "pg";
+import { assertCapturedAuthority, captureAllocationAuthority } from "./fixture-allocation.js";
 import {
   fixtureConnectionPlan,
   fixtureEngineEnv,
@@ -171,6 +172,7 @@ export async function deployMigrations(input: {
     options: { cwd: string; env: NodeJS.ProcessEnv; stdio: "inherit" },
   ) => unknown;
 }) {
+  const authority = captureAllocationAuthority();
   fixtureConnectionPlan(input.migrationUrl);
   const migrationsDir = input.migrationsDir ?? path.join(input.dbPackageDir, "prisma/migrations");
   const held = await heldBackMigrations(
@@ -189,9 +191,11 @@ export async function deployMigrations(input: {
   }
   try {
     const concurrent = await buildsIndexConcurrently(input.migrationUrl, migrationsPath);
+    assertCapturedAuthority(authority);
     const deployUrl = concurrent
-      ? fixtureEngineUrl(input.migrationUrl)
-      : fixtureEngineUrl(input.migrationUrl, input.lockTimeoutMs ?? LOCK_TIMEOUT_MS);
+      ? fixtureEngineUrl(input.migrationUrl, undefined, authority)
+      : fixtureEngineUrl(input.migrationUrl, input.lockTimeoutMs ?? LOCK_TIMEOUT_MS, authority);
+    assertCapturedAuthority(authority);
     for (let attempt = 0; ; attempt++) {
       try {
         (input.spawn ?? execFileSync)(process.execPath, [pinnedPrismaCli(), "migrate", "deploy"], {

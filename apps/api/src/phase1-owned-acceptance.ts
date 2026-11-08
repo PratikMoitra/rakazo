@@ -85,36 +85,66 @@ export function runOwnedProcess(
   options: {
     cwd?: string;
     timeoutMs?: number;
+    closeWaitMs?: number;
     spawn?: (
       command: string,
       args: readonly string[],
-      options: { cwd?: string; env: NodeJS.ProcessEnv; detached: boolean; stdio: ["ignore", "pipe", "pipe"] },
+      options: {
+        cwd?: string;
+        env: NodeJS.ProcessEnv;
+        detached: boolean;
+        stdio: ["ignore", "pipe", "pipe"];
+      },
     ) => ChildProcess;
     signalProcess?: (pid: number, signal: NodeJS.Signals) => void;
   } = {},
 ): { result: Promise<OwnedProcessResult>; killAndWait: () => Promise<void> } {
   let child: ChildProcess | undefined;
-  let settled = false;
+  let closed = false;
+  let reported = false;
+  let pendingError: Error | undefined;
   let resolveResult: (value: OwnedProcessResult) => void = () => undefined;
+  let resolveClosed: () => void = () => undefined;
   const result = new Promise<OwnedProcessResult>((resolve) => {
     resolveResult = resolve;
   });
-  const finish = (value: OwnedProcessResult) => {
-    if (settled) return;
-    settled = true;
-    clearTimeout(timer);
+  const closedPromise = new Promise<void>((resolve) => {
+    resolveClosed = resolve;
+  });
+  const report = (value: OwnedProcessResult) => {
+    if (reported) return;
+    reported = true;
     resolveResult(value);
   };
+  const markClosed = (code: number | null) => {
+    if (closed) return;
+    closed = true;
+    clearTimeout(timer);
+    resolveClosed();
+    report({
+      code,
+      output,
+      ...(pendingError ? { error: pendingError } : {}),
+      ...(timedOut ? { error: new Error("owned process timed out") } : {}),
+    });
+  };
+  const signalFailures: unknown[] = [];
   const signalOwned = () => {
     if (!child?.pid) return;
     const signal = options.signalProcess ?? defaultSignal;
     try {
       signal(-child.pid, "SIGKILL");
-    } catch {
+    } catch (error) {
+      signalFailures.push(error);
       try {
         signal(child.pid, "SIGKILL");
-      } catch {
-        child.kill("SIGKILL");
+      } catch (fallback) {
+        signalFailures.push(fallback);
+        try {
+          child.kill("SIGKILL");
+        } catch (killError) {
+          signalFailures.push(killError);
+        }
       }
     }
   };
@@ -122,8 +152,28 @@ export function runOwnedProcess(
   let timedOut = false;
   const timer = setTimeout(() => {
     timedOut = true;
+    pendingError = new Error("owned process timed out");
     signalOwned();
   }, options.timeoutMs ?? 120_000);
+  const killAndWait = async () => {
+    if (!child?.pid) {
+      await result;
+      return;
+    }
+    if (!closed) signalOwned();
+    const exited = await Promise.race([
+      closedPromise.then(() => true),
+      new Promise<boolean>((resolve) =>
+        setTimeout(() => resolve(false), options.closeWaitMs ?? 1_000),
+      ),
+    ]);
+    if (!exited) {
+      throw new Error(
+        signalFailures.length ? "owned process signal failed" : "owned process did not exit",
+      );
+    }
+    await result;
+  };
   try {
     child = (options.spawn ?? nodeSpawn)(command, args, {
       cwd: options.cwd ?? repoRoot(),
@@ -132,8 +182,11 @@ export function runOwnedProcess(
       stdio: ["ignore", "pipe", "pipe"],
     });
   } catch (error) {
-    finish({ code: null, output: "", error: error as Error });
-    return { result, killAndWait: async () => undefined };
+    clearTimeout(timer);
+    report({ code: null, output: "", error: error as Error });
+    resolveClosed();
+    closed = true;
+    return { result, killAndWait };
   }
   child.stdout?.on("data", (chunk) => {
     output += chunk.toString();
@@ -141,21 +194,12 @@ export function runOwnedProcess(
   child.stderr?.on("data", (chunk) => {
     output += chunk.toString();
   });
-  child.on("error", (error) => finish({ code: null, output, error }));
-  child.on("close", (code) =>
-    finish({
-      code,
-      output,
-      ...(timedOut ? { error: new Error("owned process timed out") } : {}),
-    }),
-  );
-  return {
-    result,
-    killAndWait: async () => {
-      if (!settled) signalOwned();
-      await result;
-    },
-  };
+  child.on("error", (error) => {
+    pendingError = error;
+    if (!child?.pid) markClosed(null);
+  });
+  child.on("close", (code) => markClosed(code));
+  return { result, killAndWait };
 }
 
 function defaultSignal(pid: number, signal: NodeJS.Signals): void {

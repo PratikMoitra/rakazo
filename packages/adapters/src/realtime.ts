@@ -1,5 +1,11 @@
 import type { RealtimeFanout } from "@rakazo/adapter-kit";
-import { fixtureConnectionPlan, openFixtureClient } from "@rakazo/db";
+import type { AllocationAuthority } from "@rakazo/db";
+import {
+  assertCapturedAuthority,
+  captureAllocationAuthority,
+  fixtureConnectionPlan,
+  openFixtureClient,
+} from "@rakazo/db";
 import type { Notification } from "pg";
 
 const POSTGRES_CHANNEL = "rakazo_events";
@@ -39,17 +45,23 @@ export class PostgresRealtimeFanout implements RealtimeFanout {
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   private reconnectAttempt = 0;
   private closed = false;
+  private readonly authority: AllocationAuthority;
 
   constructor(private readonly options: PostgresRealtimeOptions) {
     // Validate before a deferred or injected factory can open a client.
     fixtureConnectionPlan(options.connectionString);
+    this.authority = captureAllocationAuthority();
     this.clientFactory =
       options.clientFactory ??
       (() =>
-        openFixtureClient(options.connectionString, {
-          applicationName: "rakazo-realtime",
-          connectionTimeoutMillis: 5_000,
-        }) as RealtimeListenerClient);
+        openFixtureClient(
+          options.connectionString,
+          {
+            applicationName: "rakazo-realtime",
+            connectionTimeoutMillis: 5_000,
+          },
+          this.authority,
+        ) as RealtimeListenerClient);
     this.reconnectBaseMs = options.reconnectBaseMs ?? 250;
     this.reconnectMaxMs = options.reconnectMaxMs ?? 10_000;
     this.random = options.random ?? Math.random;
@@ -115,7 +127,7 @@ export class PostgresRealtimeFanout implements RealtimeFanout {
   }
 
   private async connectClient(): Promise<void> {
-    fixtureConnectionPlan(this.options.connectionString);
+    assertCapturedAuthority(this.authority);
     const candidate = this.clientFactory();
     this.connectingClient = candidate;
     const disconnected = () => this.handleDisconnect(candidate);

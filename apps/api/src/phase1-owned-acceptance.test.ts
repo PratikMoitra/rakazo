@@ -123,3 +123,54 @@ it("kills an owned child on spawn failure and timeout before the caller continue
   expect(signals.some((pid) => Math.abs(pid) === 424242)).toBe(true);
   await hanging.killAndWait();
 });
+
+it("signals a live child after error and waits for close", async () => {
+  const signals: number[] = [];
+  const child = new EventEmitter() as ChildProcess & EventEmitter;
+  child.stdout = new EventEmitter() as ChildProcess["stdout"];
+  child.stderr = new EventEmitter() as ChildProcess["stderr"];
+  Object.defineProperty(child, "pid", { value: 515151 });
+  child.kill = () => true;
+  const owned = runOwnedProcess(
+    "sleep",
+    [],
+    {},
+    {
+      closeWaitMs: 50,
+      signalProcess: (pid) => {
+        signals.push(pid);
+        child.emit("close", null);
+      },
+      spawn: () => child,
+    },
+  );
+  child.emit("error", new Error("write EPIPE"));
+  await owned.killAndWait();
+  expect(signals).toContain(-515151);
+  const result = await owned.result;
+  expect(result.error?.message).toBe("write EPIPE");
+});
+
+it("reports a failed signal without treating the child as closed", async () => {
+  const child = new EventEmitter() as ChildProcess & EventEmitter;
+  child.stdout = new EventEmitter() as ChildProcess["stdout"];
+  child.stderr = new EventEmitter() as ChildProcess["stderr"];
+  Object.defineProperty(child, "pid", { value: 616161 });
+  child.kill = () => {
+    throw new Error("kill failed");
+  };
+  const owned = runOwnedProcess(
+    "sleep",
+    [],
+    {},
+    {
+      closeWaitMs: 30,
+      signalProcess: () => {
+        throw new Error("signal failed");
+      },
+      spawn: () => child,
+    },
+  );
+  child.emit("error", new Error("still running"));
+  await expect(owned.killAndWait()).rejects.toThrow(/signal failed/);
+});
