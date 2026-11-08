@@ -203,3 +203,44 @@ it("rejects the awaited result when timeout signals fail and close never arrives
   if (result.closed) removed = true;
   expect(removed).toBe(false);
 });
+
+it("settles the awaited result when killAndWait fails before the timeout", async () => {
+  const child = new EventEmitter() as ChildProcess & EventEmitter;
+  child.stdout = new EventEmitter() as ChildProcess["stdout"];
+  child.stderr = new EventEmitter() as ChildProcess["stderr"];
+  Object.defineProperty(child, "pid", { value: 818181 });
+  child.kill = () => {
+    throw new Error("kill failed");
+  };
+  let removed = false;
+  const owned = runOwnedProcess(
+    "sleep",
+    [],
+    {},
+    {
+      timeoutMs: 5_000,
+      closeWaitMs: 20,
+      signalProcess: () => {
+        throw new Error("signal failed");
+      },
+      spawn: () => child,
+    },
+  );
+  const started = Date.now();
+  await expect(owned.killAndWait()).rejects.toThrow(/signal failed/);
+  const result = await Promise.race([
+    owned.result,
+    new Promise<never>((_resolve, reject) => {
+      setTimeout(() => reject(new Error("result stayed pending")), 50);
+    }),
+  ]);
+  expect(Date.now() - started).toBeLessThan(200);
+  expect(result.closed).toBe(false);
+  expect(result.error?.message).toMatch(/signal failed/);
+  if (result.closed) removed = true;
+  expect(removed).toBe(false);
+  child.emit("close", null);
+  await owned.killAndWait();
+  removed = true;
+  expect(removed).toBe(true);
+});

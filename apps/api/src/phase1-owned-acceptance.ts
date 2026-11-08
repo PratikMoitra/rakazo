@@ -179,18 +179,20 @@ export function runOwnedProcess(
       return;
     }
     if (!closed) signalOwned();
+    let closeTimer: ReturnType<typeof setTimeout> | undefined;
     const exited = await Promise.race([
       closedPromise.then(() => true),
-      new Promise<boolean>((resolve) =>
-        setTimeout(() => resolve(false), options.closeWaitMs ?? 1_000),
-      ),
+      new Promise<boolean>((resolve) => {
+        closeTimer = setTimeout(() => resolve(false), options.closeWaitMs ?? 1_000);
+      }),
     ]);
+    clearTimeout(closeTimer);
     if (!exited) {
-      clearTimeout(timer);
-      clearTimeout(deadline);
-      throw new Error(
+      const error = new Error(
         signalFailures.length ? "owned process signal failed" : "owned process did not exit",
       );
+      reportUnclosed(error);
+      throw error;
     }
     await result;
   };

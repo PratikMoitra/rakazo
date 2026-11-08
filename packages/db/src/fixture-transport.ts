@@ -320,7 +320,11 @@ export function openFixturePool(connectionString: string, options: FixturePoolOp
     }
     if (typeof callback === "function") {
       return connect(
-        (error: Error | undefined, client: PoolClient | undefined, done: (err?: unknown) => void) => {
+        (
+          error: Error | undefined,
+          client: PoolClient | undefined,
+          done: (err?: unknown) => void,
+        ) => {
           if (!error && client) {
             try {
               deliver(client);
@@ -371,6 +375,45 @@ export function assertApprovedPool(pool: Pool): void {
     throw new Error("database pool was not opened by the disposable fixture transport");
   assertCapturedAuthority(approved.authority);
   assertPoolRoute(pool, approved.plan);
+}
+
+const INTERNAL_LOCK_TIMEOUT = /^-c lock_timeout=([1-9]\d{0,5})$/;
+
+/**
+ * Accepts a URL this package already built for the migration engine. The only query allowed is
+ * one internal lock timeout. The result is that URL rebuilt by the same canonical serializer.
+ */
+export function canonicalEngineInput(
+  connectionString: string,
+  authority?: AllocationAuthority,
+): string {
+  if (connectionString.includes("#")) throw new Error(ENDPOINT_REFUSAL);
+  const queryAt = connectionString.indexOf("?");
+  const bare = queryAt === -1 ? connectionString : connectionString.slice(0, queryAt);
+  if (bare.includes("?")) throw new Error(ENDPOINT_REFUSAL);
+  let timeout: number | undefined;
+  if (queryAt !== -1) {
+    let parsed: URL;
+    try {
+      parsed = new URL(connectionString);
+    } catch {
+      throw new Error(ENDPOINT_REFUSAL);
+    }
+    const seen = new Set<string>();
+    for (const [key, value] of parsed.searchParams.entries()) {
+      const name = key.toLowerCase();
+      if (seen.has(name) || name !== "options") throw new Error(ENDPOINT_REFUSAL);
+      seen.add(name);
+      const match = INTERNAL_LOCK_TIMEOUT.exec(value);
+      const parsedTimeout = match ? Number(match[1]) : Number.NaN;
+      if (!Number.isInteger(parsedTimeout) || parsedTimeout < 1 || parsedTimeout > 600_000) {
+        throw new Error(ENDPOINT_REFUSAL);
+      }
+      timeout = parsedTimeout;
+    }
+    if (timeout === undefined) throw new Error(ENDPOINT_REFUSAL);
+  }
+  return fixtureEngineUrl(bare, timeout, authority ?? captureAllocationAuthority());
 }
 
 /**

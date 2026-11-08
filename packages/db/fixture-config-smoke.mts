@@ -3,4 +3,12 @@
 if (process.env.RAKAZO_CONFIG_ARGV) {
   process.argv = ["node", "prisma", ...process.env.RAKAZO_CONFIG_ARGV.split(/\s+/)];
 }
-await import("./prisma.config.ts");
+const loaded = await import("./prisma.config.ts");
+if (process.env.RAKAZO_CHECK_ENGINE_URL === "1") {
+  const url = loaded.default?.datasource?.url;
+  if (url !== process.env.DATABASE_MIGRATION_URL) {
+    process.stderr.write("engine-url-mismatch\n");
+    process.exit(1);
+  }
+  process.stdout.write("engine-url-match\n");
+}
