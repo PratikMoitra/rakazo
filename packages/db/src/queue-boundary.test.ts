@@ -1,3 +1,4 @@
+import { Client } from "pg";
 import { describe, expect, it } from "vitest";
 import type { ExplicitPgConfig } from "./queue-boundary.js";
 import {
@@ -6,6 +7,7 @@ import {
   CREDENTIAL_DELETE_TIMEOUT_MS,
   CREDENTIAL_RETIREMENT_LEASE_SECONDS,
   credentialWorkerTarget,
+  explicitWorkerClientConfig,
   migrationAuthProbe,
   pinnedEndpointConfigs,
   preflightCredentialWorker,
@@ -145,4 +147,46 @@ describe("worker endpoint pin", () => {
     }) as Parameters<typeof attestCredentialWorker>[2]);
     expect(opened).toEqual(["migration-admin", "rakazo_credential_worker"]);
   });
+
+  it("does not take ambient password, startup options, or weakened TLS", () => {
+    const previous = {
+      password: process.env.PGPASSWORD,
+      options: process.env.PGOPTIONS,
+      ssl: process.env.PGSSLMODE,
+    };
+    process.env.PGPASSWORD = "sentinel-password";
+    process.env.PGOPTIONS = "-c sentinel_options=1";
+    process.env.PGSSLMODE = "no-verify";
+    try {
+      const plan = pinnedEndpointConfigs(migration, worker);
+      expect(() => explicitWorkerClientConfig(plan.worker)).toThrow(
+        /TLS mode is not explicitly supported/,
+      );
+      delete process.env.PGSSLMODE;
+      expect(() => explicitWorkerClientConfig(plan.worker)).toThrow(
+        /startup options are not explicitly supported/,
+      );
+      delete process.env.PGOPTIONS;
+      const built = explicitWorkerClientConfig(plan.worker);
+      const client = new Client(built);
+      const parameters = (
+        client as unknown as {
+          connectionParameters: { password?: string; ssl?: unknown; options?: string };
+        }
+      ).connectionParameters;
+      expect(parameters.password === "sentinel-password").toBe(false);
+      expect(parameters.ssl).toBe(false);
+      expect(parameters.options).toBeUndefined();
+      expect(parameters.ssl && typeof parameters.ssl === "object").toBe(false);
+    } finally {
+      restoreEnv("PGPASSWORD", previous.password);
+      restoreEnv("PGOPTIONS", previous.options);
+      restoreEnv("PGSSLMODE", previous.ssl);
+    }
+  });
 });
+
+function restoreEnv(name: "PGPASSWORD" | "PGOPTIONS" | "PGSSLMODE", value: string | undefined) {
+  if (value === undefined) delete process.env[name];
+  else process.env[name] = value;
+}

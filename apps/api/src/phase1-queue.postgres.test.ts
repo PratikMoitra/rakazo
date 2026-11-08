@@ -472,7 +472,15 @@ it.skipIf(!existsSync("/usr/lib/postgresql/16/bin/initdb"))(
                WHERE id = $1::uuid`,
               [retirementId],
             );
-            await worker.query("SELECT queue_api.purge_redacted_retirements(7)");
+            const purged = await worker.query<{ removed: number }>(
+              "SELECT queue_api.purge_redacted_retirements(7) AS removed",
+            );
+            expect(purged.rows[0]?.removed).toBeGreaterThanOrEqual(1);
+            const removedRetirement = await admin.query<{ n: number }>(
+              "SELECT count(*)::int AS n FROM queue_private.credential_retirement WHERE id = $1::uuid",
+              [retirementId],
+            );
+            expect(removedRetirement.rows[0]?.n).toBe(0);
             expect(
               await sqlState(
                 admin,

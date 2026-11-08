@@ -8,16 +8,32 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const BIN = "/usr/lib/postgresql/16/bin";
+/** pg_ctl status exit when this data directory has no running server. */
+const SERVER_NOT_RUNNING = 3;
 
-export async function startFixtureCluster(): Promise<{ url: URL; stop: () => Promise<void> }> {
-  const root = await mkdtemp(join(tmpdir(), "phase1-cluster-"));
+export type FixtureCommandResult = { code: number; stdout: string; stderr: string };
+export type FixtureCommandRunner = (
+  command: string,
+  args: string[],
+) => Promise<FixtureCommandResult>;
+
+export async function startFixtureCluster(
+  control: {
+    run?: FixtureCommandRunner;
+    remove?: (path: string) => Promise<void>;
+    directory?: string;
+  } = {},
+): Promise<{ url: URL; stop: () => Promise<void> }> {
+  const run = control.run ?? runCommand;
+  const remove = control.remove ?? ((path: string) => rm(path, { recursive: true, force: true }));
+  const root = control.directory ?? (await mkdtemp(join(tmpdir(), "phase1-cluster-")));
   const data = join(root, "data");
-  let started = false;
+  let startAttempted = false;
   try {
     const password = randomBytes(18).toString("hex");
     const passwordFile = join(root, "password");
     await writeFile(passwordFile, password, { mode: 0o600 });
-    await run(join(BIN, "initdb"), [
+    await mustRun(run, join(BIN, "initdb"), [
       "-D",
       data,
       "-U",
@@ -28,7 +44,8 @@ export async function startFixtureCluster(): Promise<{ url: URL; stop: () => Pro
       "--auth-host=scram-sha-256",
     ]);
     const port = await freePort();
-    await run(join(BIN, "pg_ctl"), [
+    startAttempted = true;
+    await mustRun(run, join(BIN, "pg_ctl"), [
       "-D",
       data,
       "-l",
@@ -37,49 +54,64 @@ export async function startFixtureCluster(): Promise<{ url: URL; stop: () => Pro
       `-p ${port} -k ${root} -c listen_addresses=127.0.0.1`,
       "start",
     ]);
-    started = true;
-    await waitUntilReady(port);
+    await waitUntilReady(port, run);
     const url = new URL("postgres://fixture_admin@127.0.0.1/postgres");
     url.port = String(port);
     url.password = password;
     return {
       url,
-      stop: () => stopOwnedServer(data, root),
+      stop: () => cleanupFixtureDataDirectory({ data, root, startAttempted: true, run, remove }),
     };
   } catch (error) {
-    if (started) await stopOwnedServer(data, root);
-    else await rm(root, { recursive: true, force: true });
+    await cleanupFixtureDataDirectory({ data, root, startAttempted, run, remove });
     throw error;
   }
 }
 
-async function stopOwnedServer(data: string, root: string): Promise<void> {
-  const stopped = await run(join(BIN, "pg_ctl"), ["-D", data, "-m", "immediate", "stop"]).then(
-    () => "",
-    (error: unknown) => (error instanceof Error ? error.message : "fixture server stop failed"),
-  );
-  if (await serverIsRunning(data)) {
+export async function cleanupFixtureDataDirectory(input: {
+  data: string;
+  root: string;
+  startAttempted: boolean;
+  run: FixtureCommandRunner;
+  remove: (path: string) => Promise<void>;
+}): Promise<void> {
+  if (!input.startAttempted) {
+    await input.remove(input.root);
+    return;
+  }
+  const stopped = await input.run(join(BIN, "pg_ctl"), [
+    "-D",
+    input.data,
+    "-m",
+    "immediate",
+    "stop",
+  ]);
+  const status = await input.run(join(BIN, "pg_ctl"), ["-D", input.data, "status"]);
+  if (status.code !== SERVER_NOT_RUNNING) {
+    const detail = status.code === 0 ? "server still running" : `status exit ${status.code}`;
+    const stopDetail = stopped.code === 0 ? "" : "stop failed";
     throw new Error(
-      stopped
-        ? `fixture server did not stop: ${stopped}`
-        : "fixture server did not stop after pg_ctl stop",
+      stopDetail
+        ? `fixture server stop uncertain: ${stopDetail}; ${detail}`
+        : `fixture server stop uncertain: ${detail}`,
     );
   }
-  await rm(root, { recursive: true, force: true });
+  await input.remove(input.root);
 }
 
-function serverIsRunning(data: string): Promise<boolean> {
-  return run(join(BIN, "pg_ctl"), ["-D", data, "status"]).then(
-    () => true,
-    () => false,
-  );
+function mustRun(run: FixtureCommandRunner, command: string, args: string[]): Promise<void> {
+  return run(command, args).then((result) => {
+    if (result.code !== 0)
+      throw new Error(result.stderr || result.stdout || "fixture command failed");
+  });
 }
 
-function run(command: string, args: string[]): Promise<void> {
-  return new Promise((resolve, reject) => {
+function runCommand(command: string, args: string[]): Promise<FixtureCommandResult> {
+  return new Promise((resolve) => {
     execFile(command, args, (error, stdout, stderr) => {
-      if (error) reject(new Error(stderr || stdout || error.message));
-      else resolve();
+      const code =
+        error && "code" in error && typeof error.code === "number" ? error.code : error ? 1 : 0;
+      resolve({ code, stdout: String(stdout ?? ""), stderr: String(stderr ?? "") });
     });
   });
 }
@@ -96,14 +128,11 @@ function freePort(): Promise<number> {
   });
 }
 
-async function waitUntilReady(port: number): Promise<void> {
+async function waitUntilReady(port: number, run: FixtureCommandRunner): Promise<void> {
   for (let attempt = 0; attempt < 50; attempt += 1) {
-    try {
-      await run(join(BIN, "pg_isready"), ["-h", "127.0.0.1", "-p", String(port)]);
-      return;
-    } catch {
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
+    const ready = await run(join(BIN, "pg_isready"), ["-h", "127.0.0.1", "-p", String(port)]);
+    if (ready.code === 0) return;
+    await new Promise((resolve) => setTimeout(resolve, 100));
   }
   throw new Error("fixture postgres did not accept connections");
 }

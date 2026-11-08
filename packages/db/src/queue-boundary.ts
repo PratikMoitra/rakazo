@@ -1,25 +1,14 @@
 // Phase-1 addition for the isolated workspace slice. Apache-2.0; see LICENSE. Not an upstream Rakazo file.
-import { createRequire } from "node:module";
 import { Client, escapeIdentifier, escapeLiteral } from "pg";
+import { parse as parseConnectionString } from "pg-connection-string";
 import { scramSha256Verifier } from "./database-access.js";
-
-const requireFromPg = createRequire(import.meta.resolve("pg/package.json"));
-const parseConnectionString = requireFromPg("pg-connection-string") as {
-  parse(value: string): {
-    host?: string | null;
-    port?: string | null;
-    database?: string | null;
-    user?: string | null;
-    password?: string | null;
-    ssl?: unknown;
-    application_name?: string | null;
-  };
-};
 
 /** Query keys that cannot change the host, port, database, login, password, socket, or TLS. */
 const BENIGN_PG_QUERY_KEYS = new Set(["application_name", "connect_timeout"]);
 
 const ENDPOINT_REFUSAL = "DATABASE_WORKER_URL is not the trusted migration endpoint";
+const TLS_REFUSAL = "DATABASE_WORKER_URL TLS mode is not explicitly supported";
+const OPTIONS_REFUSAL = "DATABASE_WORKER_URL startup options are not explicitly supported";
 
 const QUEUE_OWNER = "rakazo_queue_owner";
 /** The only login `pnpm db:migrate` will create for credential cleanup. */
@@ -113,9 +102,9 @@ export function pinnedEndpointConfigs(
 
 function explicitPgConfig(value: string): ExplicitPgConfig {
   assertBenignPgQuery(value);
-  let parsed: ReturnType<typeof parseConnectionString.parse>;
+  let parsed: ReturnType<typeof parseConnectionString>;
   try {
-    parsed = parseConnectionString.parse(value);
+    parsed = parseConnectionString(value);
   } catch {
     throw new Error(ENDPOINT_REFUSAL);
   }
@@ -166,7 +155,10 @@ function sameEndpoint(left: ExplicitPgConfig, right: ExplicitPgConfig): boolean 
   return left.host === right.host && left.port === right.port && left.database === right.database;
 }
 
-function openExplicitClientConfig(config: ExplicitPgConfig) {
+export function explicitWorkerClientConfig(config: ExplicitPgConfig) {
+  if (!config.password) throw new Error(ENDPOINT_REFUSAL);
+  if (process.env.PGSSLMODE) throw new Error(TLS_REFUSAL);
+  if (process.env.PGOPTIONS) throw new Error(OPTIONS_REFUSAL);
   return {
     host: config.host,
     port: config.port,
@@ -174,11 +166,13 @@ function openExplicitClientConfig(config: ExplicitPgConfig) {
     user: config.user,
     password: config.password,
     application_name: config.application_name,
+    // Explicit false: pg otherwise reads PGSSLMODE, including no-verify.
+    ssl: false as const,
   };
 }
 
 function openExplicitClient(config: ExplicitPgConfig): CredentialWorkerConnection {
-  return new Client(openExplicitClientConfig(config));
+  return new Client(explicitWorkerClientConfig(config));
 }
 
 export async function preflightCredentialWorker(
@@ -428,7 +422,7 @@ export async function attestCredentialWorker(
   migrationUrl: string,
   workerUrl: string,
   open: (config: ExplicitPgConfig) => CredentialWorkerConnection = (config) =>
-    new Client({ ...openExplicitClientConfig(config), connectionTimeoutMillis: 3000 }),
+    new Client({ ...explicitWorkerClientConfig(config), connectionTimeoutMillis: 3000 }),
 ): Promise<void> {
   const endpoints = pinnedEndpointConfigs(migrationUrl, workerUrl);
   if (

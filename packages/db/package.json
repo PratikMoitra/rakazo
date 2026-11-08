@@ -25,6 +25,7 @@
     "@rakazo/core": "workspace:*",
     "@rakazo/logging": "workspace:*",
     "pg": "8.23.1",
+    "pg-connection-string": "2.14.1",
     "dotenv": "17.4.2"
   },
   "devDependencies": {

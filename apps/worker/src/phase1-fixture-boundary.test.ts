@@ -6,6 +6,27 @@ import { join } from "node:path";
 import { expect, it } from "vitest";
 import { rejectPhase1FixtureFlags } from "./reject-phase1-fixtures.js";
 
+function runBuilt(script: string, env: NodeJS.ProcessEnv) {
+  return new Promise<{ code: number | null; output: string }>((resolve) => {
+    const child = spawn(process.execPath, ["--enable-source-maps", script], {
+      cwd: "/workspace",
+      env,
+    });
+    let output = "";
+    child.stdout?.on("data", (chunk) => {
+      output += chunk.toString();
+    });
+    child.stderr?.on("data", (chunk) => {
+      output += chunk.toString();
+    });
+    const timer = setTimeout(() => child.kill("SIGTERM"), 20_000);
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolve({ code, output });
+    });
+  });
+}
+
 it("rejects fixture flags for every NODE_ENV value", () => {
   expect(() =>
     rejectPhase1FixtureFlags({
@@ -48,8 +69,46 @@ it("keeps the dummy store out of the production worker bundle", async () => {
     expect(bundled).not.toContain("crashAfterDelete");
     expect(bundled).not.toContain("process.exit(75)");
     expect(bundled).toContain("phase1 fixture flags are not accepted");
+    expect(bundled).not.toContain("import.meta.resolve");
+    const ran = await runBuilt(outfile, {
+      PATH: process.env.PATH ?? "",
+      NODE_ENV: "production",
+      PHASE1_DUMMY_SECRET_STORE: join(workerRoot, "dist/not-created.json"),
+      DATABASE_URL: "postgres://fixture:fixture@127.0.0.1:1/none",
+      REALTIME_DATABASE_URL: "postgres://fixture:fixture@127.0.0.1:1/none",
+    });
+    expect(ran.output).not.toContain("ERR_MODULE_NOT_FOUND");
+    expect(ran.output).toContain("phase1 fixture flags are not accepted");
+    expect(ran.code).not.toBe(0);
   } finally {
     await rm(join(workerRoot, "dist"), { recursive: true, force: true });
+  }
+});
+
+it("loads the built API entry without a missing pg module", async () => {
+  const apiRoot = new URL("../../api/", import.meta.url).pathname;
+  const outfile = join(apiRoot, "dist/index.js");
+  try {
+    await new Promise<void>((resolve, reject) => {
+      execFile(
+        "node",
+        ["../../scripts/build-server.mjs", "src/index.ts"],
+        { cwd: apiRoot },
+        (error, stdout, stderr) => {
+          if (error) reject(new Error(stderr || stdout || error.message));
+          else resolve();
+        },
+      );
+    });
+    const ran = await runBuilt(outfile, {
+      PATH: process.env.PATH ?? "",
+      NODE_ENV: "test",
+      PHASE1_DUMMY_SECRET_STORE: join(apiRoot, "dist/not-created.json"),
+    });
+    expect(ran.output).not.toContain("ERR_MODULE_NOT_FOUND");
+    expect(ran.output).not.toContain("ECONNREFUSED");
+  } finally {
+    await rm(join(apiRoot, "dist"), { recursive: true, force: true });
   }
 });
 
