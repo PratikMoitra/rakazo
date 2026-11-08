@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
+import type { ExplicitPgConfig } from "./queue-boundary.js";
 import {
   assertPinnedWorkerEndpoint,
+  attestCredentialWorker,
   CREDENTIAL_DELETE_TIMEOUT_MS,
   CREDENTIAL_RETIREMENT_LEASE_SECONDS,
   credentialWorkerTarget,
   migrationAuthProbe,
+  pinnedEndpointConfigs,
   preflightCredentialWorker,
 } from "./queue-boundary.js";
 
@@ -49,48 +52,58 @@ describe("credentialWorkerTarget", () => {
 
 describe("worker endpoint pin", () => {
   const migration = "postgres://migration-admin:migration-secret@trusted.example:5432/app";
+  const worker = "postgres://rakazo_credential_worker:worker-secret@trusted.example:5432/app";
+
+  function refused(value: string) {
+    return preflightCredentialWorker(migration, value, () => {
+      throw new Error("connection constructed");
+    });
+  }
 
   it("rejects an untrusted host before any connection is constructed", async () => {
     const hostile = "postgres://rakazo_credential_worker:worker-secret@untrusted.example:5432/app";
-    const opened: string[] = [];
     expect(() => assertPinnedWorkerEndpoint(migration, hostile)).toThrow(
       /trusted migration endpoint/,
     );
     expect(migrationAuthProbe()).toBeNull();
+    await expect(refused(hostile)).rejects.toThrow(/trusted migration endpoint/);
     await expect(
-      preflightCredentialWorker(migration, hostile, (connectionString) => {
-        opened.push(connectionString);
-        throw new Error("connection constructed");
-      }),
+      refused("postgres://rakazo_credential_worker:worker-secret@127.0.0.1:5432/app"),
     ).rejects.toThrow(/trusted migration endpoint/);
-    expect(opened).toEqual([]);
-    expect(() =>
-      assertPinnedWorkerEndpoint(
-        migration,
-        "postgres://rakazo_credential_worker:worker-secret@127.0.0.1:5432/app",
-      ),
-    ).toThrow(/trusted migration endpoint/);
   });
 
-  it("opens only the original migration endpoint when the worker URL is pinned", async () => {
-    const worker = "postgres://rakazo_credential_worker:worker-secret@trusted.example:5432/app";
-    const opened: string[] = [];
+  it("rejects query routing, authentication, socket, and TLS overrides before any client", async () => {
+    const overrides = [
+      "postgres://rakazo_credential_worker:worker-secret@trusted.example:5432/app?host=other.invalid&port=6543",
+      "postgres://rakazo_credential_worker:worker-secret@trusted.example:5432/app?host=trusted.example&host=other.invalid",
+      "postgres://rakazo_credential_worker:worker-secret@trusted.example:5432/app?%68ost=other.invalid",
+      "postgres://rakazo_credential_worker:worker-secret@trusted.example:5432/app?user=migration-admin",
+      "postgres://rakazo_credential_worker:worker-secret@trusted.example:5432/app?password=other-secret",
+      "postgres://rakazo_credential_worker:worker-secret@trusted.example:5432/app?hostaddr=10.1.2.3",
+      "postgres://rakazo_credential_worker:worker-secret@trusted.example:5432/app?sslmode=disable",
+      "postgres://rakazo_credential_worker:worker-secret@trusted.example:5432/app?sslmode=no-verify",
+      "socket:///tmp/pg.sock?db=app&user=rakazo_credential_worker",
+      "postgres://rakazo_credential_worker:worker-secret@%2Ftmp%2Fpg.sock/app",
+    ];
+    for (const value of overrides) {
+      expect(() => pinnedEndpointConfigs(migration, value)).toThrow(/trusted migration endpoint/);
+    }
+    await expect(refused(overrides[0] ?? "")).rejects.toThrow(/trusted migration endpoint/);
+    expect(migrationAuthProbe()).toBeNull();
+  });
+
+  it("opens only the parsed migration config when the worker URL is pinned", async () => {
+    const opened: ExplicitPgConfig[] = [];
     let reads = 0;
-    await preflightCredentialWorker(migration, worker, ((connectionString) => {
-      opened.push(connectionString);
+    await preflightCredentialWorker(migration, `${worker}?application_name=phase1`, ((config) => {
+      opened.push(config);
       return {
         async connect() {},
         async query() {
           reads += 1;
           if (reads === 1) {
             return {
-              rows: [
-                {
-                  db: "app",
-                  session_user: "migration-admin",
-                  owner_name: "migration-admin",
-                },
-              ],
+              rows: [{ db: "app", session_user: "migration-admin", owner_name: "migration-admin" }],
               rowCount: 1,
             };
           }
@@ -99,6 +112,37 @@ describe("worker endpoint pin", () => {
         async end() {},
       };
     }) as Parameters<typeof preflightCredentialWorker>[2]);
-    expect(opened).toEqual([migration]);
+    expect(opened.map((config) => config.user)).toEqual(["migration-admin"]);
+    expect(opened.map((config) => config.host)).toEqual(["trusted.example"]);
+    expect(opened.map((config) => config.port)).toEqual([5432]);
+  });
+
+  it("attests with the worker login on the trusted endpoint", async () => {
+    const plan = pinnedEndpointConfigs(migration, worker);
+    expect(plan.migration.user).toBe("migration-admin");
+    expect(plan.worker.user).toBe("rakazo_credential_worker");
+    expect(plan.migration.host).toBe(plan.worker.host);
+    const opened: string[] = [];
+    await attestCredentialWorker(migration, worker, ((config) => {
+      opened.push(config.user);
+      return {
+        async connect() {},
+        async query() {
+          return {
+            rows: [
+              {
+                ident: "1",
+                db: "app",
+                session_user: config.user,
+                current_user: config.user,
+              },
+            ],
+            rowCount: 1,
+          };
+        },
+        async end() {},
+      };
+    }) as Parameters<typeof attestCredentialWorker>[2]);
+    expect(opened).toEqual(["migration-admin", "rakazo_credential_worker"]);
   });
 });

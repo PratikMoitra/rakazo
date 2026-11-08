@@ -60,11 +60,12 @@ it("rejects fixture flags at production startup before creating a dummy file", a
     const child = spawn("/workspace/node_modules/.bin/tsx", ["src/index.ts"], {
       cwd: "/workspace/apps/worker",
       env: {
-        ...process.env,
+        PATH: process.env.PATH ?? "",
         NODE_ENV: "production",
         PHASE1_DUMMY_SECRET_STORE: file,
         PHASE1_DUMMY_CRASH_AFTER_DELETE: "1",
         DATABASE_URL: "postgres://fixture:fixture@127.0.0.1:1/none",
+        REALTIME_DATABASE_URL: "postgres://fixture:fixture@127.0.0.1:1/none",
       },
     });
     let output = "";
@@ -86,4 +87,39 @@ it("rejects fixture flags at production startup before creating a dummy file", a
   expect(result.output).toContain("phase1 fixture flags are not accepted");
   await expect(readFile(file, "utf8")).rejects.toThrow();
   await rm(dir, { recursive: true, force: true });
+});
+
+it("keeps fixture sources out of deployment copy contexts", async () => {
+  const root = new URL("../../../", import.meta.url);
+  const ignore = await readFile(new URL(".dockerignore", root), "utf8");
+  const workerPackage = await readFile(new URL("apps/worker/package.json", root), "utf8");
+  for (const name of [
+    "apps/worker/src/phase1-fixture-secret-store.ts",
+    "apps/worker/src/phase1-cleanup-fixture-main.ts",
+    "apps/api/src/phase1-fixture-cluster.ts",
+    "apps/api/src/phase1-cleanup-once.ts",
+    "**/*.test.ts",
+  ]) {
+    expect(ignore).toContain(name);
+  }
+  const ignored = ignore
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith("#"));
+  expect(ignored).not.toContain("apps/worker/src/reject-phase1-fixtures.ts");
+  expect(workerPackage).toContain(
+    '"build": "node ../../scripts/build-server.mjs src/index.ts src/health-check.ts"',
+  );
+  for (const dockerfile of [
+    "infra/compose/Dockerfile",
+    "infra/railway/Dockerfile",
+    "infra/compose/Dockerfile.topology",
+  ]) {
+    const source = await readFile(new URL(dockerfile, root), "utf8");
+    expect(source).toContain("COPY");
+    expect(source).not.toContain("phase1-cleanup-fixture-main");
+  }
+  const preview = await readFile(new URL("infra/preview/Dockerfile", root), "utf8");
+  expect(preview.includes(`FROM ${"$"}{SERVER_IMAGE}`)).toBe(true);
+  expect(preview).not.toContain("COPY --chmod=755 . .");
 });

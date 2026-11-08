@@ -1,6 +1,25 @@
 // Phase-1 addition for the isolated workspace slice. Apache-2.0; see LICENSE. Not an upstream Rakazo file.
+import { createRequire } from "node:module";
 import { Client, escapeIdentifier, escapeLiteral } from "pg";
 import { scramSha256Verifier } from "./database-access.js";
+
+const requireFromPg = createRequire(import.meta.resolve("pg/package.json"));
+const parseConnectionString = requireFromPg("pg-connection-string") as {
+  parse(value: string): {
+    host?: string | null;
+    port?: string | null;
+    database?: string | null;
+    user?: string | null;
+    password?: string | null;
+    ssl?: unknown;
+    application_name?: string | null;
+  };
+};
+
+/** Query keys that cannot change the host, port, database, login, password, socket, or TLS. */
+const BENIGN_PG_QUERY_KEYS = new Set(["application_name", "connect_timeout"]);
+
+const ENDPOINT_REFUSAL = "DATABASE_WORKER_URL is not the trusted migration endpoint";
 
 const QUEUE_OWNER = "rakazo_queue_owner";
 /** The only login `pnpm db:migrate` will create for credential cleanup. */
@@ -53,16 +72,27 @@ export interface CredentialWorkerConnection {
 }
 
 /**
- * Compares the worker URL's host, port, and database with the migration URL.
- * It does not open a connection and does not copy migration authentication
- * onto another host. A different host fails closed, including aliases that
- * would require a network lookup to confirm.
+ * Fields taken from the installed pg connection-string parser. Clients are
+ * constructed from these fields and do not receive the original string.
+ */
+export interface ExplicitPgConfig {
+  host: string;
+  port: number;
+  database: string;
+  user: string;
+  password?: string;
+  application_name?: string;
+}
+
+/**
+ * Compares the effective host, port, and database. Query routing, authentication,
+ * socket, and TLS overrides are rejected before any client exists. A different
+ * host fails closed, including aliases that would require a network lookup.
  */
 export function assertPinnedWorkerEndpoint(migrationUrl: string, workerUrl: string): void {
-  const migration = parsedEndpoint(migrationUrl);
-  const worker = parsedEndpoint(workerUrl);
-  if (!migration || !worker || migration !== worker) {
-    throw new Error("DATABASE_WORKER_URL is not the trusted migration endpoint");
+  const endpoints = pinnedEndpointConfigs(migrationUrl, workerUrl);
+  if (!sameEndpoint(endpoints.migration, endpoints.worker)) {
+    throw new Error(ENDPOINT_REFUSAL);
   }
 }
 
@@ -71,31 +101,102 @@ export function migrationAuthProbe(): null {
   return null;
 }
 
-function parsedEndpoint(value: string): string | undefined {
+export function pinnedEndpointConfigs(
+  migrationUrl: string,
+  workerUrl: string,
+): { migration: ExplicitPgConfig; worker: ExplicitPgConfig } {
+  return {
+    migration: explicitPgConfig(migrationUrl),
+    worker: explicitPgConfig(workerUrl),
+  };
+}
+
+function explicitPgConfig(value: string): ExplicitPgConfig {
+  assertBenignPgQuery(value);
+  let parsed: ReturnType<typeof parseConnectionString.parse>;
   try {
-    const url = new URL(value);
-    const database = decodeURIComponent(url.pathname.replace(/^\//, ""));
-    if (!url.hostname || !database) return undefined;
-    return `${url.hostname.toLowerCase()}:${url.port || "5432"}/${database}`;
+    parsed = parseConnectionString.parse(value);
   } catch {
-    return undefined;
+    throw new Error(ENDPOINT_REFUSAL);
+  }
+  if (parsed.ssl !== undefined || !parsed.host || parsed.host.startsWith("/")) {
+    throw new Error(ENDPOINT_REFUSAL);
+  }
+  const database = parsed.database ?? "";
+  const user = parsed.user ?? "";
+  const port = parsed.port ? Number(parsed.port) : 5432;
+  if (!database || !user || !Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(ENDPOINT_REFUSAL);
+  }
+  const applicationName = parsed.application_name ?? undefined;
+  if (applicationName !== undefined && !/^[A-Za-z0-9_.-]{1,64}$/.test(applicationName)) {
+    throw new Error(ENDPOINT_REFUSAL);
+  }
+  return {
+    host: parsed.host.toLowerCase(),
+    port,
+    database,
+    user,
+    ...(typeof parsed.password === "string" && parsed.password.length > 0
+      ? { password: parsed.password }
+      : {}),
+    ...(applicationName ? { application_name: applicationName } : {}),
+  };
+}
+
+function assertBenignPgQuery(value: string): void {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error(ENDPOINT_REFUSAL);
+  }
+  if (url.protocol !== "postgres:" && url.protocol !== "postgresql:") {
+    throw new Error(ENDPOINT_REFUSAL);
+  }
+  const seen = new Set<string>();
+  for (const [rawKey] of url.searchParams.entries()) {
+    const key = rawKey.toLowerCase();
+    if (seen.has(key) || !BENIGN_PG_QUERY_KEYS.has(key)) throw new Error(ENDPOINT_REFUSAL);
+    seen.add(key);
   }
 }
 
-function openMigrationClient(connectionString: string): CredentialWorkerConnection {
-  return new Client({ connectionString });
+function sameEndpoint(left: ExplicitPgConfig, right: ExplicitPgConfig): boolean {
+  return left.host === right.host && left.port === right.port && left.database === right.database;
+}
+
+function openExplicitClientConfig(config: ExplicitPgConfig) {
+  return {
+    host: config.host,
+    port: config.port,
+    database: config.database,
+    user: config.user,
+    password: config.password,
+    application_name: config.application_name,
+  };
+}
+
+function openExplicitClient(config: ExplicitPgConfig): CredentialWorkerConnection {
+  return new Client(openExplicitClientConfig(config));
 }
 
 export async function preflightCredentialWorker(
   migrationUrl: string,
   workerUrl: string,
-  open: (connectionString: string) => CredentialWorkerConnection = openMigrationClient,
+  open: (config: ExplicitPgConfig) => CredentialWorkerConnection = openExplicitClient,
 ): Promise<void> {
   const target = credentialWorkerTarget(migrationUrl, workerUrl);
   if (target.mode !== "on") return;
-  assertPinnedWorkerEndpoint(migrationUrl, workerUrl);
-  const workerDatabase = databaseName(workerUrl);
-  const owner = open(migrationUrl);
+  const endpoints = pinnedEndpointConfigs(migrationUrl, workerUrl);
+  if (
+    !sameEndpoint(endpoints.migration, endpoints.worker) ||
+    endpoints.worker.user !== target.login
+  ) {
+    throw new Error(ENDPOINT_REFUSAL);
+  }
+  const workerDatabase = endpoints.worker.database;
+  const owner = open(endpoints.migration);
   await owner.connect();
   try {
     const [here] = (
@@ -326,10 +427,18 @@ export async function provisionCredentialWorker(
 export async function attestCredentialWorker(
   migrationUrl: string,
   workerUrl: string,
+  open: (config: ExplicitPgConfig) => CredentialWorkerConnection = (config) =>
+    new Client({ ...openExplicitClientConfig(config), connectionTimeoutMillis: 3000 }),
 ): Promise<void> {
-  assertPinnedWorkerEndpoint(migrationUrl, workerUrl);
-  const admin = new Client({ connectionString: migrationUrl });
-  const worker = new Client({ connectionString: workerUrl, connectionTimeoutMillis: 3000 });
+  const endpoints = pinnedEndpointConfigs(migrationUrl, workerUrl);
+  if (
+    !sameEndpoint(endpoints.migration, endpoints.worker) ||
+    endpoints.worker.user !== MANAGED_CREDENTIAL_WORKER
+  ) {
+    throw new Error(ENDPOINT_REFUSAL);
+  }
+  const admin = open(endpoints.migration);
+  const worker = open(endpoints.worker);
   try {
     await admin.connect();
     await worker.connect();
@@ -430,12 +539,6 @@ async function grantQueuePolicy(owner: Client, policy: string, role: string): Pr
 
 function loginOf(url: string): string {
   return decodeURIComponent(new URL(url).username);
-}
-
-function databaseName(url: string): string {
-  const name = decodeURIComponent(new URL(url).pathname.replace(/^\//, ""));
-  if (!name) throw new Error("DATABASE_WORKER_URL must name a database");
-  return name;
 }
 
 async function legacyQueueCounts(owner: Client): Promise<{

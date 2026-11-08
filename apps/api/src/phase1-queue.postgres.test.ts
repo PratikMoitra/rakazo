@@ -14,6 +14,7 @@ import {
 } from "@rakazo/db";
 import { expect, it } from "vitest";
 import { startFixtureCluster } from "./phase1-fixture-cluster.js";
+import { fixtureChildEnv } from "./phase1-fixture-env.js";
 
 it.skipIf(!existsSync("/usr/lib/postgresql/16/bin/initdb"))(
   "provisions credential cleanup on a fixture cluster and restarts the worker with operator assistance",
@@ -416,18 +417,24 @@ it.skipIf(!existsSync("/usr/lib/postgresql/16/bin/initdb"))(
            VALUES ('phase1-lock', 'slack', 'W-lock', 'W', $1, $2, $3, 'lock-key', now(), now())`,
               [spaceId, userId, botId],
             );
-            await holder.query("BEGIN");
-            await holder.query("SELECT queue_api.lock_credential_fingerprint('lock-key')");
-            await holder.query(
-              `UPDATE queue_private.credential_fingerprint
-           SET state = 'retiring'
-           WHERE object_id = queue_api.credential_fingerprint('lock-key')`,
+            const activeControl = await admin.query<{ n: number }>(
+              "SELECT count(*)::int AS n FROM messaging_installations WHERE id = 'phase1-lock' AND ciphertext = 'lock-key'",
             );
+            expect(activeControl.rows[0]?.n).toBe(1);
+            await holder.query("BEGIN");
+            const captured = await holder.query<{ id: string }>(
+              "SELECT queue_api.capture_current_credential('phase1-lock') AS id",
+            );
+            const retirementId = captured.rows[0]?.id ?? "";
+            await holder.query("DELETE FROM messaging_installations WHERE id = 'phase1-lock'");
+            await holder.query("SELECT queue_api.enqueue_captured_credential($1::uuid)", [
+              retirementId,
+            ]);
             let settled = false;
             const waiting = restorer.query(
               `INSERT INTO messaging_installations
              (id, provider, "workspaceId", "workspaceName", "spaceId", "userId", "botId", ciphertext, "createdAt", "updatedAt")
-           VALUES ('phase1-restore', 'slack', 'W-restore', 'W', $1, $2, $3, 'lock-key', now(), now())`,
+           VALUES ('phase1-lock', 'slack', 'W-lock', 'W', $1, $2, $3, 'lock-key', now(), now())`,
               [spaceId, userId, botId],
             );
             const watched = waiting.then(
@@ -444,15 +451,39 @@ it.skipIf(!existsSync("/usr/lib/postgresql/16/bin/initdb"))(
             expect(settled).toBe(false);
             const blocked = await admin.query<{ n: number }>(
               `SELECT count(*)::int AS n FROM pg_stat_activity
-           WHERE wait_event_type = 'Lock' AND query LIKE '%phase1-restore%'`,
+           WHERE wait_event_type = 'Lock' AND query LIKE '%INSERT INTO messaging_installations%'
+             AND query LIKE '%phase1-lock%'`,
             );
             expect(blocked.rows[0]?.n).toBe(1);
             await holder.query("COMMIT");
             await expect(watched).rejects.toMatchObject({ code: "23514" });
             const restored = await admin.query<{ n: number }>(
-              "SELECT count(*)::int AS n FROM messaging_installations WHERE id = 'phase1-restore'",
+              "SELECT count(*)::int AS n FROM messaging_installations WHERE id = 'phase1-lock'",
             );
             expect(restored.rows[0]?.n).toBe(0);
+            await admin.query(
+              `UPDATE queue_private.credential_fingerprint
+               SET state = 'retired'
+               WHERE object_id = queue_api.credential_fingerprint('lock-key')`,
+            );
+            await admin.query(
+              `UPDATE queue_private.credential_retirement
+               SET state = 'deleted', retired_ref = NULL, redacted_at = clock_timestamp() - interval '8 days'
+               WHERE id = $1::uuid`,
+              [retirementId],
+            );
+            await worker.query("SELECT queue_api.purge_redacted_retirements(7)");
+            expect(
+              await sqlState(
+                admin,
+                "SELECT queue_api.register_active_credential('phase1-lock', 'lock-key')",
+              ),
+            ).toBe("23514");
+            const tombstone = await admin.query<{ state: string }>(
+              `SELECT state FROM queue_private.credential_fingerprint
+               WHERE object_id = queue_api.credential_fingerprint('lock-key')`,
+            );
+            expect(tombstone.rows[0]?.state).toBe("retired");
           } finally {
             await holder.query("ROLLBACK").catch(() => undefined);
             holder.release();
@@ -611,15 +642,18 @@ function runMigrate(database: URL, workerUrl: URL, runtimeUrl?: URL) {
       ["--filter", "@rakazo/api", "db:migrate"],
       {
         cwd: "/workspace",
-        env: {
-          ...process.env,
-          DATABASE_URL: (runtimeUrl ?? database).toString(),
-          DATABASE_MIGRATION_URL: database.toString(),
-          DATABASE_WORKER_URL: workerUrl.toString(),
-        },
+        env: fixtureChildEnv({
+          databaseUrl: (runtimeUrl ?? database).toString(),
+          migrationUrl: database.toString(),
+          workerUrl: workerUrl.toString(),
+          realtimeUrl: database.toString(),
+        }),
       },
       (error, stdout, stderr) => {
-        const output = `${stderr}\n${stdout}`.replaceAll(database.toString(), "[database]");
+        const output = `${stderr}\n${stdout}`
+          .replaceAll(database.toString(), "[database]")
+          .replaceAll(workerUrl.toString(), "[worker]")
+          .replaceAll((runtimeUrl ?? database).toString(), "[database]");
         if (error) reject(new Error(output));
         else resolve();
       },
@@ -645,20 +679,12 @@ function startWorkerMain(
     {
       cwd: "/workspace/apps/worker",
       stdio: ["ignore", "pipe", "pipe"],
-      env: {
-        ...process.env,
-        DATABASE_URL: database.toString(),
-        DATABASE_MIGRATION_URL: database.toString(),
-        DATABASE_WORKER_URL: workerUrl.toString(),
-        PHASE1_DUMMY_SECRET_STORE: "",
-        PHASE1_DUMMY_CRASH_AFTER_DELETE: "",
-        SANDBOX_PROVIDER: "none",
-        AGENT_RUNTIME: "scripted",
-        NODE_ENV: "production",
-        RAKAZO_ALLOW_DEV_SECRETS: "1",
-        DB_POOL_MAX: "8",
-        WAKEUP_DRIVER: "",
-      },
+      env: fixtureChildEnv({
+        databaseUrl: database.toString(),
+        migrationUrl: database.toString(),
+        workerUrl: workerUrl.toString(),
+        realtimeUrl: database.toString(),
+      }),
     },
   );
   child.stdout?.on("data", (chunk) => {
@@ -793,7 +819,12 @@ function psql(url: URL, sql: string) {
         "-c",
         sql,
       ],
-      { env: { ...process.env, PGPASSWORD: decodeURIComponent(url.password) } },
+      {
+        env: {
+          PATH: process.env.PATH ?? "",
+          PGPASSWORD: decodeURIComponent(url.password),
+        },
+      },
       (error, stdout, stderr) => {
         if (error) reject(new Error(stderr || stdout || error.message));
         else resolve();
