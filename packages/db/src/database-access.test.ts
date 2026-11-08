@@ -18,7 +18,7 @@ function open(): Client {
         return { rowCount: 1, rows: [{ can: true, superuser: true }] };
       return sql.startsWith("SELECT 1") ? { rowCount: 1, rows: [{}] } : { rowCount: 0, rows: [] };
     },
-  } as Client;
+  } as unknown as Client;
 }
 
 const owner = "postgres://rakazo:owner-password@postgres:5432/rakazo";
