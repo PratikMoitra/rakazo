@@ -14,7 +14,10 @@ import { expect, it } from "vitest";
 import { createApp } from "./app.js";
 
 const migrationUrl = process.env.DATABASE_MIGRATION_URL ?? process.env.DATABASE_URL;
-const enabled = process.env.VERIFY_DATABASE === "1" && Boolean(migrationUrl);
+const enabled =
+  process.env.RAKAZO_DISPOSABLE_FIXTURE === "1" &&
+  process.env.VERIFY_DATABASE === "1" &&
+  Boolean(migrationUrl);
 
 it.skipIf(!enabled)(
   "enforces cross-space artifact denial as a non-owner runtime role",

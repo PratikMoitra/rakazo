@@ -9,6 +9,9 @@ const BENIGN_PG_QUERY_KEYS = new Set(["application_name", "connect_timeout"]);
 const ENDPOINT_REFUSAL = "DATABASE_WORKER_URL is not the trusted migration endpoint";
 const TLS_REFUSAL = "DATABASE_WORKER_URL TLS mode is not explicitly supported";
 const OPTIONS_REFUSAL = "DATABASE_WORKER_URL startup options are not explicitly supported";
+const PLAINTEXT_REFUSAL =
+  "plaintext database transport requires an explicit disposable fixture on literal loopback";
+const LITERAL_LOOPBACK = new Set(["127.0.0.1", "::1"]);
 
 const QUEUE_OWNER = "rakazo_queue_owner";
 /** The only login `pnpm db:migrate` will create for credential cleanup. */
@@ -121,8 +124,10 @@ function explicitPgConfig(value: string): ExplicitPgConfig {
   if (applicationName !== undefined && !/^[A-Za-z0-9_.-]{1,64}$/.test(applicationName)) {
     throw new Error(ENDPOINT_REFUSAL);
   }
+  const host = parsed.host.toLowerCase();
+  assertLiteralLoopback(value, host);
   return {
-    host: parsed.host.toLowerCase(),
+    host,
     port,
     database,
     user,
@@ -131,6 +136,24 @@ function explicitPgConfig(value: string): ExplicitPgConfig {
       : {}),
     ...(applicationName ? { application_name: applicationName } : {}),
   };
+}
+
+function assertLiteralLoopback(value: string, host: string): void {
+  if (process.env.RAKAZO_DISPOSABLE_FIXTURE !== "1" || !LITERAL_LOOPBACK.has(host)) {
+    throw new Error(PLAINTEXT_REFUSAL);
+  }
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error(PLAINTEXT_REFUSAL);
+  }
+  const presented = url.hostname.toLowerCase();
+  if (presented.includes("%") || presented.includes(",") || presented.includes("@")) {
+    throw new Error(PLAINTEXT_REFUSAL);
+  }
+  const literal = presented.startsWith("[") ? presented.slice(1, -1) : presented;
+  if (literal !== host) throw new Error(PLAINTEXT_REFUSAL);
 }
 
 function assertBenignPgQuery(value: string): void {
@@ -156,6 +179,9 @@ function sameEndpoint(left: ExplicitPgConfig, right: ExplicitPgConfig): boolean 
 }
 
 export function explicitWorkerClientConfig(config: ExplicitPgConfig) {
+  if (process.env.RAKAZO_DISPOSABLE_FIXTURE !== "1" || !LITERAL_LOOPBACK.has(config.host)) {
+    throw new Error(PLAINTEXT_REFUSAL);
+  }
   if (!config.password) throw new Error(ENDPOINT_REFUSAL);
   if (process.env.PGSSLMODE) throw new Error(TLS_REFUSAL);
   if (process.env.PGOPTIONS) throw new Error(OPTIONS_REFUSAL);
@@ -190,6 +216,8 @@ export async function preflightCredentialWorker(
     throw new Error(ENDPOINT_REFUSAL);
   }
   const workerDatabase = endpoints.worker.database;
+  explicitWorkerClientConfig(endpoints.migration);
+  explicitWorkerClientConfig(endpoints.worker);
   const owner = open(endpoints.migration);
   await owner.connect();
   try {
@@ -431,6 +459,8 @@ export async function attestCredentialWorker(
   ) {
     throw new Error(ENDPOINT_REFUSAL);
   }
+  explicitWorkerClientConfig(endpoints.migration);
+  explicitWorkerClientConfig(endpoints.worker);
   const admin = open(endpoints.migration);
   const worker = open(endpoints.worker);
   try {

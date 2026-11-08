@@ -19,6 +19,8 @@ import { fixtureChildEnv } from "./phase1-fixture-env.js";
 it.skipIf(!existsSync("/usr/lib/postgresql/16/bin/initdb"))(
   "provisions credential cleanup on a fixture cluster and restarts the worker with operator assistance",
   async () => {
+    const previousFixture = process.env.RAKAZO_DISPOSABLE_FIXTURE;
+    process.env.RAKAZO_DISPOSABLE_FIXTURE = "1";
     const refusal = await startFixtureCluster();
     let success: { url: URL; stop: () => Promise<void> } | undefined;
     const databaseUrl = refusal.url.toString();
@@ -626,6 +628,8 @@ it.skipIf(!existsSync("/usr/lib/postgresql/16/bin/initdb"))(
       }
     } finally {
       if (!refusalStopped) await refusal.stop();
+      if (previousFixture === undefined) delete process.env.RAKAZO_DISPOSABLE_FIXTURE;
+      else process.env.RAKAZO_DISPOSABLE_FIXTURE = previousFixture;
     }
   },
   180_000,

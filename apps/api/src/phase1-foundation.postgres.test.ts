@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EmailEmulator, LocalArtifactStore } from "@rakazo/adapters";
 import { DEFAULT_UPLOAD_MAX_BYTES } from "@rakazo/contracts";
-import { asSystem } from "@rakazo/db";
+import { asSystem, createDb } from "@rakazo/db";
 import { expect, it } from "vitest";
 import { requeueRunAfterShutdown } from "../../../packages/adapters/src/run-lifecycle.js";
 import { attachWorkspaceFileToThread } from "../../../packages/adapters/src/thread-artifacts.js";
@@ -13,7 +13,10 @@ import { createApp } from "./app.js";
 import { rpcRequestMaxBytes } from "./request-body-limit.js";
 import { setUploadPolicy } from "./upload-policy.js";
 
-const databaseUrl = process.env.VERIFY_DATABASE === "1" ? process.env.DATABASE_URL : undefined;
+const databaseUrl =
+  process.env.RAKAZO_DISPOSABLE_FIXTURE === "1" && process.env.VERIFY_DATABASE === "1"
+    ? process.env.DATABASE_URL
+    : undefined;
 const origin = "http://127.0.0.1:5173";
 const limit = DEFAULT_UPLOAD_MAX_BYTES;
 
@@ -425,7 +428,11 @@ it.skipIf(!databaseUrl)(
         where: { id: "default" },
         select: { maxUploadSizeBytes: true },
       });
-      await system.$executeRawUnsafe(`
+      const migrationUrl = process.env.DATABASE_MIGRATION_URL ?? databaseUrl;
+      const ownerDb = createDb(migrationUrl!);
+      const owner = asSystem(ownerDb.prisma);
+      try {
+        await owner.$executeRawUnsafe(`
         CREATE OR REPLACE FUNCTION phase1_fail_upload_audit() RETURNS trigger
         LANGUAGE plpgsql AS $fn$
         BEGIN
@@ -436,32 +443,42 @@ it.skipIf(!databaseUrl)(
         END
         $fn$
       `);
-      await system.$executeRawUnsafe(
-        `DROP TRIGGER IF EXISTS phase1_fail_upload_audit ON audit_events`,
-      );
-      await system.$executeRawUnsafe(`
+        await owner.$executeRawUnsafe(
+          `DROP TRIGGER IF EXISTS phase1_fail_upload_audit ON audit_events`,
+        );
+        await owner.$executeRawUnsafe(`
         CREATE TRIGGER phase1_fail_upload_audit
         BEFORE INSERT ON audit_events
         FOR EACH ROW EXECUTE FUNCTION phase1_fail_upload_audit()
       `);
-      const failedAudit = await call(adminCookie, "uploadPolicy/set", {
-        maxFileBytes:
-          beforeFailure.maxUploadSizeBytes === 1024 * 1024 ? 2 * 1024 * 1024 : 1024 * 1024,
-      });
-      expect(failedAudit.status).toBeGreaterThanOrEqual(500);
-      expect(
-        (
-          await system.deploymentSettings.findUniqueOrThrow({
-            where: { id: "default" },
-            select: { maxUploadSizeBytes: true },
-          })
-        ).maxUploadSizeBytes,
-      ).toBe(beforeFailure.maxUploadSizeBytes);
-      expect(await audits()).toBe(settledAudits);
-      await system.$executeRawUnsafe(
-        `DROP TRIGGER IF EXISTS phase1_fail_upload_audit ON audit_events`,
-      );
-      await system.$executeRawUnsafe(`DROP FUNCTION IF EXISTS phase1_fail_upload_audit()`);
+        const failedAudit = await call(adminCookie, "uploadPolicy/set", {
+          maxFileBytes:
+            beforeFailure.maxUploadSizeBytes === 1024 * 1024 ? 2 * 1024 * 1024 : 1024 * 1024,
+        });
+        expect(failedAudit.status).toBeGreaterThanOrEqual(500);
+        expect(
+          (
+            await system.deploymentSettings.findUniqueOrThrow({
+              where: { id: "default" },
+              select: { maxUploadSizeBytes: true },
+            })
+          ).maxUploadSizeBytes,
+        ).toBe(beforeFailure.maxUploadSizeBytes);
+        expect(await audits()).toBe(settledAudits);
+        await owner.$executeRawUnsafe(
+          `DROP TRIGGER IF EXISTS phase1_fail_upload_audit ON audit_events`,
+        );
+        await owner.$executeRawUnsafe(`DROP FUNCTION IF EXISTS phase1_fail_upload_audit()`);
+      } finally {
+        await owner
+          .$executeRawUnsafe(`DROP TRIGGER IF EXISTS phase1_fail_upload_audit ON audit_events`)
+          .catch(() => undefined);
+        await owner
+          .$executeRawUnsafe(`DROP FUNCTION IF EXISTS phase1_fail_upload_audit()`)
+          .catch(() => undefined);
+        await ownerDb.prisma.$disconnect();
+        await ownerDb.pool.end();
+      }
       const smallOver = await call(cookie, "artifacts/create", {
         botId,
         name: "small-over.txt",
@@ -513,12 +530,6 @@ it.skipIf(!databaseUrl)(
           where: { id: "default" },
           data: { maxUploadSizeBytes: null },
         })
-        .catch(() => undefined);
-      await system
-        .$executeRawUnsafe(`DROP TRIGGER IF EXISTS phase1_fail_upload_audit ON audit_events`)
-        .catch(() => undefined);
-      await system
-        .$executeRawUnsafe(`DROP FUNCTION IF EXISTS phase1_fail_upload_audit()`)
         .catch(() => undefined);
       await handles.stop();
       await rm(dataDir, { recursive: true, force: true });

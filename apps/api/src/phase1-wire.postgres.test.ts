@@ -12,7 +12,10 @@ import { asSystem } from "@rakazo/db";
 import { expect, it } from "vitest";
 import { createApp } from "./app.js";
 
-const databaseUrl = process.env.VERIFY_DATABASE === "1" ? process.env.DATABASE_URL : undefined;
+const databaseUrl =
+  process.env.RAKAZO_DISPOSABLE_FIXTURE === "1" && process.env.VERIFY_DATABASE === "1"
+    ? process.env.DATABASE_URL
+    : undefined;
 const origin = "http://127.0.0.1:5173";
 
 it.skipIf(!databaseUrl)(

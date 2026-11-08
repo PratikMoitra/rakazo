@@ -27,6 +27,7 @@ export * from "./database-access.js";
 export * from "./queue-boundary.js";
 export * from "./deferred-migrations.js";
 export * from "./events.js";
+export * from "./fixture-flags.js";
 export * from "./expire-stuck-run.js";
 export * from "./external-conversations.js";
 export * from "./groups.js";

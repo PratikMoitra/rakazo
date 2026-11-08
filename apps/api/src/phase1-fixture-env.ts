@@ -13,6 +13,7 @@ const FIXTURE_ENV_KEYS = [
   "RAKAZO_ALLOW_DEV_SECRETS",
   "DB_POOL_MAX",
   "ENCRYPTION_KEY",
+  "RAKAZO_DISPOSABLE_FIXTURE",
 ] as const;
 
 export function fixtureChildEnv(input: {
@@ -33,6 +34,7 @@ export function fixtureChildEnv(input: {
     RAKAZO_ALLOW_DEV_SECRETS: "1",
     DB_POOL_MAX: "8",
     ENCRYPTION_KEY: "phase1-fixture-encryption-key-32ch",
+    RAKAZO_DISPOSABLE_FIXTURE: "1",
   };
 }
 

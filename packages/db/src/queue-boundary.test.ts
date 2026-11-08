@@ -53,8 +53,8 @@ describe("credentialWorkerTarget", () => {
 });
 
 describe("worker endpoint pin", () => {
-  const migration = "postgres://migration-admin:migration-secret@trusted.example:5432/app";
-  const worker = "postgres://rakazo_credential_worker:worker-secret@trusted.example:5432/app";
+  const migration = "postgres://migration-admin:migration-secret@127.0.0.1:5432/app";
+  const worker = "postgres://rakazo_credential_worker:worker-secret@127.0.0.1:5432/app";
 
   function refused(value: string) {
     return preflightCredentialWorker(migration, value, () => {
@@ -62,19 +62,50 @@ describe("worker endpoint pin", () => {
     });
   }
 
+  it("rejects plaintext outside an explicit loopback fixture before any client", async () => {
+    const previous = process.env.RAKAZO_DISPOSABLE_FIXTURE;
+    const nodeEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = "test";
+    delete process.env.RAKAZO_DISPOSABLE_FIXTURE;
+    try {
+      await expect(refused(worker)).rejects.toThrow(/literal loopback/);
+      process.env.RAKAZO_DISPOSABLE_FIXTURE = "1";
+      process.env.NODE_ENV = "production";
+      const remote = [
+        "localhost",
+        "db.internal",
+        "127.0.0.2",
+        "10.0.0.8",
+        "192.168.0.2",
+        "8.8.8.8",
+        "0.0.0.0",
+        "::ffff:127.0.0.1",
+      ];
+      for (const host of remote) {
+        const value = `postgres://rakazo_credential_worker:worker-secret@${host.includes(":") ? `[${host}]` : host}:5432/app`;
+        await expect(refused(value)).rejects.toThrow(/literal loopback/);
+      }
+    } finally {
+      if (previous === undefined) delete process.env.RAKAZO_DISPOSABLE_FIXTURE;
+      else process.env.RAKAZO_DISPOSABLE_FIXTURE = previous;
+      if (nodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = nodeEnv;
+    }
+  });
+
   it("rejects an untrusted host before any connection is constructed", async () => {
     const hostile = "postgres://rakazo_credential_worker:worker-secret@untrusted.example:5432/app";
-    expect(() => assertPinnedWorkerEndpoint(migration, hostile)).toThrow(
-      /trusted migration endpoint/,
-    );
+    expect(() => assertPinnedWorkerEndpoint(migration, hostile)).toThrow(/literal loopback/);
     expect(migrationAuthProbe()).toBeNull();
-    await expect(refused(hostile)).rejects.toThrow(/trusted migration endpoint/);
+    await expect(refused(hostile)).rejects.toThrow(/literal loopback/);
     await expect(
-      refused("postgres://rakazo_credential_worker:worker-secret@127.0.0.1:5432/app"),
-    ).rejects.toThrow(/trusted migration endpoint/);
+      refused("postgres://rakazo_credential_worker:worker-secret@127.0.0.1:5432/other"),
+    ).rejects.toThrow(/literal loopback/);
   });
 
   it("rejects query routing, authentication, socket, and TLS overrides before any client", async () => {
+    const previous = process.env.RAKAZO_DISPOSABLE_FIXTURE;
+    process.env.RAKAZO_DISPOSABLE_FIXTURE = "1";
     const overrides = [
       "postgres://rakazo_credential_worker:worker-secret@trusted.example:5432/app?host=other.invalid&port=6543",
       "postgres://rakazo_credential_worker:worker-secret@trusted.example:5432/app?host=trusted.example&host=other.invalid",
@@ -92,9 +123,13 @@ describe("worker endpoint pin", () => {
     }
     await expect(refused(overrides[0] ?? "")).rejects.toThrow(/trusted migration endpoint/);
     expect(migrationAuthProbe()).toBeNull();
+    if (previous === undefined) delete process.env.RAKAZO_DISPOSABLE_FIXTURE;
+    else process.env.RAKAZO_DISPOSABLE_FIXTURE = previous;
   });
 
   it("opens only the parsed migration config when the worker URL is pinned", async () => {
+    const previous = process.env.RAKAZO_DISPOSABLE_FIXTURE;
+    process.env.RAKAZO_DISPOSABLE_FIXTURE = "1";
     const opened: ExplicitPgConfig[] = [];
     let reads = 0;
     await preflightCredentialWorker(migration, `${worker}?application_name=phase1`, ((config) => {
@@ -115,14 +150,19 @@ describe("worker endpoint pin", () => {
       };
     }) as Parameters<typeof preflightCredentialWorker>[2]);
     expect(opened.map((config) => config.user)).toEqual(["migration-admin"]);
-    expect(opened.map((config) => config.host)).toEqual(["trusted.example"]);
+    expect(opened.map((config) => config.host)).toEqual(["127.0.0.1"]);
     expect(opened.map((config) => config.port)).toEqual([5432]);
+    if (previous === undefined) delete process.env.RAKAZO_DISPOSABLE_FIXTURE;
+    else process.env.RAKAZO_DISPOSABLE_FIXTURE = previous;
   });
 
   it("attests with the worker login on the trusted endpoint", async () => {
+    const previous = process.env.RAKAZO_DISPOSABLE_FIXTURE;
+    process.env.RAKAZO_DISPOSABLE_FIXTURE = "1";
     const plan = pinnedEndpointConfigs(migration, worker);
     expect(plan.migration.user).toBe("migration-admin");
     expect(plan.worker.user).toBe("rakazo_credential_worker");
+    expect(plan.migration.host).toBe("127.0.0.1");
     expect(plan.migration.host).toBe(plan.worker.host);
     const opened: string[] = [];
     await attestCredentialWorker(migration, worker, ((config) => {
@@ -146,9 +186,13 @@ describe("worker endpoint pin", () => {
       };
     }) as Parameters<typeof attestCredentialWorker>[2]);
     expect(opened).toEqual(["migration-admin", "rakazo_credential_worker"]);
+    if (previous === undefined) delete process.env.RAKAZO_DISPOSABLE_FIXTURE;
+    else process.env.RAKAZO_DISPOSABLE_FIXTURE = previous;
   });
 
   it("does not take ambient password, startup options, or weakened TLS", () => {
+    const fixture = process.env.RAKAZO_DISPOSABLE_FIXTURE;
+    process.env.RAKAZO_DISPOSABLE_FIXTURE = "1";
     const previous = {
       password: process.env.PGPASSWORD,
       options: process.env.PGOPTIONS,
@@ -182,6 +226,8 @@ describe("worker endpoint pin", () => {
       restoreEnv("PGPASSWORD", previous.password);
       restoreEnv("PGOPTIONS", previous.options);
       restoreEnv("PGSSLMODE", previous.ssl);
+      if (fixture === undefined) delete process.env.RAKAZO_DISPOSABLE_FIXTURE;
+      else process.env.RAKAZO_DISPOSABLE_FIXTURE = fixture;
     }
   });
 });

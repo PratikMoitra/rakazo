@@ -105,6 +105,8 @@ it("loads the built API entry without a missing pg module", async () => {
       NODE_ENV: "test",
       PHASE1_DUMMY_SECRET_STORE: join(apiRoot, "dist/not-created.json"),
     });
+    expect(ran.code).toBe(1);
+    expect(ran.output).toContain("phase1 fixture flags are not accepted");
     expect(ran.output).not.toContain("ERR_MODULE_NOT_FOUND");
     expect(ran.output).not.toContain("ECONNREFUSED");
   } finally {

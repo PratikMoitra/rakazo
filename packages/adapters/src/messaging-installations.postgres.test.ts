@@ -25,7 +25,9 @@ import { SlackInstallProvider } from "./slack-install-provider.js";
 // PHASE1_FIXTURE_CLUSTER is set only by a process that created a new PostgreSQL
 // cluster. VERIFY_DATABASE alone must not run this suite against a preserved database.
 const describePostgres =
-  process.env.PHASE1_FIXTURE_CLUSTER === "1" && process.env.DATABASE_URL
+  process.env.RAKAZO_DISPOSABLE_FIXTURE === "1" &&
+  process.env.PHASE1_FIXTURE_CLUSTER === "1" &&
+  process.env.DATABASE_URL
     ? describe.sequential
     : describe.skip;
 describePostgres("messaging workspace installation (PostgreSQL)", () => {
