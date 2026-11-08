@@ -21,8 +21,12 @@ export class MessagingInstallations implements MessagingInstallationStore {
     readonly provider: MessagingInstallProvider,
     _cleanupJobs?: Pick<JobPublisher, "enqueue">,
     private readonly credentials?: {
-      register: (tx: Pick<PrismaClient, "$queryRaw">, objectKey: string) => Promise<void>;
-      recordOrphan: (objectKey: string) => Promise<void>;
+      register: (
+        tx: Pick<PrismaClient, "$queryRaw">,
+        installationId: string,
+        objectKey: string,
+      ) => Promise<void>;
+      recordOrphan: (objectKey: string, installationId: string, recordId: string) => Promise<void>;
       retirement?: {
         capture: (tx: Pick<PrismaClient, "$queryRaw">, installationId: string) => Promise<string>;
         enqueue: (tx: Pick<PrismaClient, "$queryRaw">, workItemId: string) => Promise<void>;
@@ -135,7 +139,7 @@ export class MessagingInstallations implements MessagingInstallationStore {
       try {
         await this.prisma.$transaction(async (tx) => {
           if (!this.credentials) throw new Error("credential object registry is not configured");
-          await this.credentials.register(tx, sealed.ciphertext);
+          await this.credentials.register(tx, id, sealed.ciphertext);
           const retiring =
             previousCiphertext && previousCiphertext !== sealed.ciphertext
               ? await this.credentials.retirement!.capture(tx, id)
@@ -182,7 +186,9 @@ export class MessagingInstallations implements MessagingInstallationStore {
             where: { id },
             select: { ciphertext: true },
           });
-          if (current?.ciphertext !== sealed.ciphertext) await this.recordOrphan(sealed.ciphertext);
+          if (current?.ciphertext !== sealed.ciphertext) {
+            await this.recordOrphan(sealed.ciphertext, id);
+          }
         } catch {
           getLogger().warn("unused messaging credential cleanup failed");
         }
@@ -326,12 +332,12 @@ export class MessagingInstallations implements MessagingInstallationStore {
       return { ...installation, credential: await this.secrets.load(ciphertext, row.id) };
     });
   }
-  private async recordOrphan(objectKey: string): Promise<void> {
+  private async recordOrphan(objectKey: string, installationId: string): Promise<void> {
+    if (!this.credentials) throw new Error("credential_orphan_unrecorded");
     try {
-      if (!this.credentials) throw new Error("credential object registry is not configured");
-      await this.credentials.recordOrphan(objectKey);
+      await this.credentials.recordOrphan(objectKey, installationId, installationId);
     } catch {
-      getLogger().warn("uncommitted messaging credential was not recorded");
+      throw new Error("credential_orphan_unrecorded");
     }
   }
 

@@ -6,20 +6,34 @@ import type { Pool } from "pg";
 
 type RetirementClient = Pick<PrismaClient, "$queryRaw">;
 
+const CLEANUP_ERROR_CODES = new Set([
+  "credential_cleanup_failed",
+  "credential_cleanup_retry",
+  "credential_cleanup_invariant",
+]);
+
+/** Stable cleanup failures. Retry and invariant stay distinct from a terminal delete failure. */
+export function cleanupErrorCode(message: string): boolean {
+  return CLEANUP_ERROR_CODES.has(message);
+}
+
 /** Registers a new physical object. A retiring, retired, or orphan object is refused. */
 export async function registerActiveCredential(
   tx: RetirementClient,
+  installationId: string,
   objectKey: string,
 ): Promise<void> {
-  await tx.$queryRaw`SELECT queue_api.register_active_credential(${objectKey}::text)`;
+  await tx.$queryRaw`SELECT queue_api.register_active_credential(${installationId}::text, ${objectKey}::text)`;
 }
 
 /** Records an object that was created and never committed. Does not delete it. */
 export async function recordOrphanCredential(
   tx: RetirementClient,
   objectKey: string,
+  installationId: string,
+  recordId: string,
 ): Promise<void> {
-  await tx.$queryRaw`SELECT queue_api.record_orphan_credential(${objectKey}::text)`;
+  await tx.$queryRaw`SELECT queue_api.record_orphan_credential(${objectKey}::text, ${installationId}::text, ${recordId}::text)`;
 }
 
 /** Copies the installation's current reference and returns the retirement id. */
@@ -53,20 +67,30 @@ export async function performCredentialCleanup(
   workItemId: string,
 ): Promise<void> {
   const claimed = await deps.pool.query<{
-    installation_id: string;
-    retired_ref: string;
-    fence: string;
+    status: string;
+    installation_id: string | null;
+    retired_ref: string | null;
+    fence: string | null;
   }>(
-    "SELECT installation_id, retired_ref, fence FROM queue_api.claim_credential_retirement($1::uuid)",
+    "SELECT status, installation_id, retired_ref, fence FROM queue_api.claim_credential_retirement($1::uuid)",
     [workItemId],
   );
   const retirement = claimed.rows[0];
-  if (!retirement) return;
+  if (!retirement || retirement.status === "terminal") return;
+  if (retirement.status === "busy") throw new Error("credential_cleanup_retry");
+  if (
+    retirement.status !== "ready" ||
+    !retirement.installation_id ||
+    !retirement.retired_ref ||
+    !retirement.fence
+  ) {
+    throw new Error("credential_cleanup_invariant");
+  }
   const renewed = await deps.pool.query<{ ok: number }>(
     "SELECT queue_api.renew_credential_lease($1::uuid, $2::uuid) AS ok",
     [workItemId, retirement.fence],
   );
-  if (renewed.rows[0]?.ok !== 1) return;
+  if (renewed.rows[0]?.ok !== 1) throw new Error("credential_cleanup_retry");
   try {
     try {
       await deps.secretStore.delete(retirement.retired_ref, {
@@ -83,7 +107,14 @@ export async function performCredentialCleanup(
     ]);
     await deps.pool.query("SELECT queue_api.redact_dispatch_errors()");
   } catch (error) {
-    if (error instanceof Error && error.message === "credential_cleanup_failed") throw error;
-    throw new Error("credential_cleanup_failed");
+    if (
+      error instanceof Error &&
+      (error.message === "credential_cleanup_failed" ||
+        error.message === "credential_cleanup_retry" ||
+        error.message === "credential_cleanup_invariant")
+    ) {
+      throw error;
+    }
+    throw new Error("credential_cleanup_retry");
   }
 }

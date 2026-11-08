@@ -83,8 +83,10 @@ describePostgres("messaging workspace installation (PostgreSQL)", () => {
       ),
       undefined,
       {
-        register: (tx, objectKey) => registerActiveCredential(tx, objectKey),
-        recordOrphan: (objectKey) => recordOrphanCredential(prisma, objectKey),
+        register: (tx, installationId, objectKey) =>
+          registerActiveCredential(tx, installationId, objectKey),
+        recordOrphan: (objectKey, installationId, recordId) =>
+          recordOrphanCredential(prisma, objectKey, installationId, recordId),
         retirement: {
           capture: (tx, installationId) => captureCredentialRetirement(tx, installationId),
           enqueue: (tx, workItemId) => enqueueCredentialRetirement(tx, workItemId),
@@ -305,9 +307,10 @@ describePostgres("messaging workspace installation (PostgreSQL)", () => {
     const personal = await asSystem(prisma).bot.create({
       data: { spaceId: actor.spaceId, userId: actor.userId, name: "Personal", color: "ink" },
     });
-    await registerActiveCredential(prisma, "fake-unused-ciphertext");
+    await registerActiveCredential(prisma, "phase1-cascade", "fake-unused-ciphertext");
     const installation = await asSystem(prisma).messagingInstallation.create({
       data: {
+        id: "phase1-cascade",
         provider: "slack",
         workspaceId: "T-CASCADE",
         workspaceName: "Example workspace",

@@ -26,6 +26,7 @@ import { pollCloudAgent } from "./cloud-agent-poll.js";
 import { expireComputerControl, scheduleComputerControlExpiry } from "./computer-control.js";
 import { rateLimitEnds, scheduleComputerSleep, sleepComputerIfIdle } from "./computer-idle.js";
 import { performComputerUpdate } from "./computer-update.js";
+import { cleanupErrorCode } from "./credential-cleanup.js";
 import type { createRunExecutor } from "./executor.js";
 import type { ExpoPushProvider } from "./expo-push.js";
 import { compactHistory } from "./history-compaction.js";
@@ -156,7 +157,7 @@ export function createBackgroundJobHandlers(deps: {
       try {
         await deps.cleanupRetiredCredential(workItemId);
       } catch (error) {
-        if (error instanceof Error && error.message === "credential_cleanup_failed") throw error;
+        if (error instanceof Error && cleanupErrorCode(error.message)) throw error;
         throw new Error("credential_cleanup_failed");
       }
     },

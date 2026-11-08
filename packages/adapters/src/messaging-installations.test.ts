@@ -252,7 +252,11 @@ it("removes an unreferenced secret if persisting an installation fails", async (
   const state = await begin(f);
   f.prisma.messagingInstallation.create.mockRejectedValueOnce(new Error("write failed"));
   await expect(f.manager.complete(actor, state, "code")).rejects.toThrow("write failed");
-  expect(f.credentials.recordOrphan).toHaveBeenCalledWith("sealed-token");
+  expect(f.credentials.recordOrphan).toHaveBeenCalledWith(
+    "sealed-token",
+    expect.any(String),
+    expect.any(String),
+  );
   expect(f.secrets.delete).not.toHaveBeenCalled();
 });
 

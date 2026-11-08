@@ -1,5 +1,9 @@
 // Phase-1 addition for the isolated workspace slice. Apache-2.0; see LICENSE. Not an upstream Rakazo file.
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { performCredentialCleanup } from "@rakazo/adapters";
 import {
   countLegacyCredentialJobs,
@@ -32,7 +36,7 @@ it.skipIf(!databaseUrl)(
       GRANT CONNECT ON DATABASE ${adminUrl.pathname.slice(1)} TO rakazo_phase1_api;
       GRANT rakazo_app TO rakazo_phase1_api;`,
     );
-    const admin = createPool(databaseUrl!);
+    let admin = createPool(databaseUrl!);
     const ownerBefore = await admin.query<{ rolcanlogin: boolean }>(
       "SELECT rolcanlogin FROM pg_roles WHERE rolname = 'rakazo_queue_owner'",
     );
@@ -67,10 +71,56 @@ it.skipIf(!databaseUrl)(
     await admin.query(
       "DELETE FROM queue_private.work_item WHERE id = '00000000-0000-4000-8000-000000000001'",
     );
-    await runMigrate(workerUrl);
-    const api = createPool(apiUrl.toString());
-    const worker = createPool(workerUrl.toString());
-    const created = createDb(databaseUrl!);
+    const passwordBefore = await admin.query<{ rolpassword: string | null }>(
+      "SELECT rolpassword FROM pg_authid WHERE rolname = 'rakazo_credential_worker'",
+    );
+    const unrelatedDb = await createFreshDatabase(adminUrl);
+    await expect(
+      runMigrate(
+        unrelatedDb,
+        loginUrl(unrelatedDb, "rakazo_credential_worker", "phase1-worker-password"),
+      ),
+    ).rejects.toThrow(/unrelated preexisting role/);
+    const passwordAfter = await admin.query<{ rolpassword: string | null }>(
+      "SELECT rolpassword FROM pg_authid WHERE rolname = 'rakazo_credential_worker'",
+    );
+    expect(passwordAfter.rows).toEqual(passwordBefore.rows);
+    expect(await migrationCount(unrelatedDb)).toBe(0);
+    await dropManagedWorker(adminUrl);
+
+    const legacyDb = await createFreshDatabase(adminUrl);
+    await seedLegacyQueue(legacyDb);
+    await expect(
+      runMigrate(
+        legacyDb,
+        loginUrl(legacyDb, "rakazo_credential_worker", "phase1-worker-password"),
+      ),
+    ).rejects.toThrow(/upgrade refused/);
+    expect(await migrationCount(legacyDb)).toBe(0);
+    expect(
+      await scalar(legacyDb, "SELECT count(*)::int AS n FROM queue_private.credential_retirement"),
+    ).toBe(4);
+    expect(
+      await scalar(
+        legacyDb,
+        "SELECT count(*)::int AS n FROM messaging_installations WHERE length(ciphertext) > 0",
+      ),
+    ).toBe(1);
+
+    const fresh = await createFreshDatabase(adminUrl);
+    const freshWorker = loginUrl(fresh, "rakazo_credential_worker", "phase1-worker-password");
+    const freshApi = loginUrl(fresh, "rakazo_phase1_api", "phase1-api-password");
+    await runMigrate(fresh, freshWorker, freshApi);
+    await psql(
+      fresh,
+      `GRANT CONNECT ON DATABASE ${fresh.pathname.slice(1)} TO rakazo_phase1_api;
+       GRANT rakazo_app TO rakazo_phase1_api;`,
+    );
+    await admin.end();
+    admin = createPool(fresh.toString());
+    const api = createPool(freshApi.toString());
+    const worker = createPool(freshWorker.toString());
+    const created = createDb(fresh.toString());
     const secrets = new Map<string, number>();
     const deleted: string[] = [];
     const secretStore = {
@@ -129,6 +179,17 @@ it.skipIf(!databaseUrl)(
           "SELECT * FROM queue_api.claim_credential_retirement('00000000-0000-0000-0000-000000000000'::uuid)",
         ),
       ).toBe("42501");
+      expect(
+        await sqlState(
+          api,
+          "ALTER TABLE messaging_installations DISABLE TRIGGER credential_object_is_attachable",
+        ),
+      ).toBe("42501");
+      expect(await sqlState(api, "SET session_replication_role = replica")).toBe("42501");
+      expect(await sqlState(api, "SET ROLE rakazo_queue_owner")).toBe("42501");
+      expect(
+        await sqlState(api, "UPDATE queue_private.credential_fingerprint SET state = 'active'"),
+      ).toBe("42501");
 
       const userId = "phase1-cleanup-user";
       const spaceId = "phase1-cleanup-space";
@@ -154,7 +215,9 @@ it.skipIf(!databaseUrl)(
          VALUES ($1, 'Cleanup', $2, $3, 'ink', now(), now()) ON CONFLICT (id) DO NOTHING`,
         [botId, spaceId, userId],
       );
-      await admin.query("SELECT queue_api.register_active_credential('retired-a')");
+      await admin.query(
+        "SELECT queue_api.register_active_credential('phase1-install', 'retired-a')",
+      );
       await admin.query(
         `INSERT INTO messaging_installations
            (id, provider, "workspaceId", "workspaceName", "spaceId", "userId", "botId", ciphertext, "createdAt", "updatedAt")
@@ -189,7 +252,9 @@ it.skipIf(!databaseUrl)(
           [workItemId],
         );
         expect(version.rows[0]?.version).toBe(1);
-        await client.query("SELECT queue_api.register_active_credential('current-b')");
+        await client.query(
+          "SELECT queue_api.register_active_credential('phase1-install', 'current-b')",
+        );
         await client.query(
           `UPDATE messaging_installations SET ciphertext = 'current-b' WHERE id = 'phase1-install'`,
         );
@@ -217,12 +282,59 @@ it.skipIf(!databaseUrl)(
         "SELECT ciphertext = 'current-b' AS ok FROM messaging_installations WHERE id = 'phase1-install'",
       );
       expect(stillCurrent.rows[0]?.ok).toBe(true);
-      const child = await runCleanupProcess(workerUrl, workItemId);
-      expect(child).toBe("deleted");
+      const held = await worker.query<{ status: string }>(
+        "SELECT status FROM queue_api.claim_credential_retirement($1::uuid)",
+        [workItemId],
+      );
+      expect(held.rows[0]?.status).toBe("ready");
+      await expect(
+        performCredentialCleanup({ pool: worker, secretStore }, workItemId),
+      ).rejects.toThrow("credential_cleanup_retry");
+      const busy = await admin.query<{ state: string }>(
+        "SELECT state FROM queue_private.credential_retirement WHERE id = $1::uuid",
+        [workItemId],
+      );
+      expect(busy.rows[0]?.state).toBe("leased");
+      await admin.query(
+        `UPDATE queue_private.credential_retirement
+         SET leased_until = clock_timestamp() - interval '1 second'
+         WHERE id = $1::uuid`,
+        [workItemId],
+      );
+      const renewed = await worker.query<{ ok: number }>(
+        "SELECT queue_api.renew_credential_lease($1::uuid, $2::uuid) AS ok",
+        [workItemId, "00000000-0000-4000-8000-000000000099"],
+      );
+      expect(renewed.rows[0]?.ok).toBe(0);
+      const crashingStore = {
+        async delete(ref: string) {
+          await secretStore.delete(ref);
+          throw new Error("crash");
+        },
+      };
+      await expect(
+        performCredentialCleanup({ pool: worker, secretStore: crashingStore }, workItemId),
+      ).rejects.toThrow("credential_cleanup_failed");
+      expect(secrets.get("retired-a")).toBe(0);
       expect(secrets.get("current-b")).toBe(1);
-      deleted.push("retired-a");
+      await admin.query(
+        `UPDATE queue_private.credential_retirement
+         SET leased_until = clock_timestamp() - interval '1 second'
+         WHERE id = $1::uuid`,
+        [workItemId],
+      );
       await performCredentialCleanup({ pool: worker, secretStore }, workItemId);
-      expect(deleted).toHaveLength(1);
+      expect(deleted).toEqual(["retired-a"]);
+      const missing = "00000000-0000-4000-8000-0000000000aa";
+      await admin.query(
+        `INSERT INTO queue_private.credential_retirement
+           (id, installation_id, retired_ref, version, state)
+         VALUES ($1::uuid, 'missing-install', 'missing-ref', 1, 'pending')`,
+        [missing],
+      );
+      await expect(
+        performCredentialCleanup({ pool: worker, secretStore }, missing),
+      ).rejects.toThrow("credential_cleanup_invariant");
       await admin.query(
         `SELECT graphile_worker.add_job(
            'work.dispatch'::text,
@@ -260,7 +372,9 @@ it.skipIf(!databaseUrl)(
       );
       expect(purged.rows[0]?.removed).toBeGreaterThanOrEqual(1);
 
-      await admin.query("SELECT queue_api.register_active_credential('same-ref')");
+      await admin.query(
+        "SELECT queue_api.register_active_credential('phase1-install-2', 'same-ref')",
+      );
       await admin.query(
         `INSERT INTO messaging_installations
            (id, provider, "workspaceId", "workspaceName", "spaceId", "userId", "botId", ciphertext, "createdAt", "updatedAt")
@@ -271,16 +385,65 @@ it.skipIf(!databaseUrl)(
       const skip = await admin.query<{ id: string }>(
         "SELECT queue_api.capture_current_credential('phase1-install-2') AS id",
       );
-      const skipped = await worker.query(
-        "SELECT installation_id FROM queue_api.claim_credential_retirement($1::uuid)",
+      const skipped = await worker.query<{ status: string }>(
+        "SELECT status FROM queue_api.claim_credential_retirement($1::uuid)",
         [skip.rows[0]?.id],
       );
-      expect(skipped.rowCount).toBe(0);
+      expect(skipped.rows).toEqual([{ status: "terminal" }]);
       const skippedState = await admin.query<{ state: string; retired_ref: string | null }>(
         "SELECT state, retired_ref FROM queue_private.credential_retirement WHERE id = $1::uuid",
         [skip.rows[0]?.id],
       );
       expect(skippedState.rows[0]).toEqual({ state: "skipped_current", retired_ref: null });
+
+      const holder = await admin.connect();
+      const restorer = await admin.connect();
+      try {
+        await admin.query("SELECT queue_api.register_active_credential('phase1-lock', 'lock-key')");
+        await admin.query(
+          `INSERT INTO messaging_installations
+             (id, provider, "workspaceId", "workspaceName", "spaceId", "userId", "botId", ciphertext, "createdAt", "updatedAt")
+           VALUES ('phase1-lock', 'slack', 'W-lock', 'W', $1, $2, $3, 'lock-key', now(), now())`,
+          [spaceId, userId, botId],
+        );
+        await holder.query("BEGIN");
+        await holder.query("SELECT queue_api.lock_credential_fingerprint('lock-key')");
+        await holder.query(
+          `UPDATE queue_private.credential_fingerprint
+           SET state = 'retiring'
+           WHERE object_id = queue_api.credential_fingerprint('lock-key')`,
+        );
+        let settled = false;
+        const waiting = restorer
+          .query("SELECT queue_api.register_active_credential('phase1-lock', 'lock-key')")
+          .then(
+            () => {
+              settled = true;
+            },
+            () => {
+              settled = true;
+            },
+          );
+        await new Promise((resolve) => setTimeout(resolve, 400));
+        expect(settled).toBe(false);
+        const blocked = await admin.query<{ n: number }>(
+          `SELECT count(*)::int AS n FROM pg_stat_activity
+           WHERE wait_event_type = 'Lock' AND query LIKE '%register_active_credential%'`,
+        );
+        expect(blocked.rows[0]?.n).toBe(1);
+        await holder.query("COMMIT");
+        await waiting;
+        expect(
+          await sqlState(
+            admin,
+            "SELECT queue_api.register_active_credential('phase1-lock', 'lock-key')",
+          ),
+        ).toBe("23514");
+      } finally {
+        await holder.query("ROLLBACK").catch(() => undefined);
+        holder.release();
+        restorer.release();
+      }
 
       const beforeLegacy = await countLegacyCredentialJobs(admin);
       const legacy = await admin.connect();
@@ -299,6 +462,100 @@ it.skipIf(!databaseUrl)(
         legacy.release();
       }
       expect(await countLegacyCredentialJobs(admin)).toBe(beforeLegacy);
+
+      const workerRetired = "worker-retired";
+      const workerCurrent = "worker-current";
+      secrets.set(workerRetired, 1);
+      await admin.query("SELECT queue_api.register_active_credential('phase1-worker', $1::text)", [
+        workerRetired,
+      ]);
+      await admin.query(
+        `INSERT INTO messaging_installations
+           (id, provider, "workspaceId", "workspaceName", "spaceId", "userId", "botId", ciphertext, "createdAt", "updatedAt")
+         VALUES ('phase1-worker', 'slack', 'W-worker', 'W', $1, $2, $3, $4, now(), now())`,
+        [spaceId, userId, botId, workerRetired],
+      );
+      const workerClient = await admin.connect();
+      let workerItem = "";
+      try {
+        await workerClient.query("BEGIN");
+        const captured = await workerClient.query<{ id: string }>(
+          "SELECT queue_api.capture_current_credential('phase1-worker') AS id",
+        );
+        workerItem = captured.rows[0]?.id ?? "";
+        await workerClient.query(
+          "SELECT queue_api.register_active_credential('phase1-worker', $1::text)",
+          [workerCurrent],
+        );
+        await workerClient.query(
+          "UPDATE messaging_installations SET ciphertext = $1 WHERE id = 'phase1-worker'",
+          [workerCurrent],
+        );
+        await workerClient.query("SELECT queue_api.enqueue_captured_credential($1::uuid)", [
+          workerItem,
+        ]);
+        await workerClient.query("COMMIT");
+      } finally {
+        workerClient.release();
+      }
+      await admin.query(
+        `DELETE FROM graphile_worker._private_jobs
+         WHERE key IS DISTINCT FROM $1`,
+        [`credential-cleanup:${workerItem}`],
+      );
+      const dummyDir = mkdtempSync(join(tmpdir(), "phase1-dummy-"));
+      const dummyFile = join(dummyDir, "secrets.json");
+      writeFileSync(
+        dummyFile,
+        JSON.stringify({ [workerRetired]: "retired-secret", [workerCurrent]: "current-secret" }),
+      );
+      const crashingWorker = startWorkerMain(fresh, freshWorker, dummyFile, { crash: true });
+      const crash = await crashingWorker.until(/PHASE1_NEVER_MATCH/);
+      expect(crash.code, crash.output).toBe(75);
+      expect(JSON.parse(readFileSync(dummyFile, "utf8"))[workerRetired]).toBeUndefined();
+      expect(JSON.parse(readFileSync(dummyFile, "utf8"))[workerCurrent]).toBe("current-secret");
+      await admin.query(
+        `UPDATE graphile_worker._private_jobs SET locked_at = NULL, locked_by = NULL
+         WHERE key = $1`,
+        [`credential-cleanup:${workerItem}`],
+      );
+      await admin.query(
+        `UPDATE queue_private.credential_retirement
+         SET leased_until = clock_timestamp() - interval '1 second'
+         WHERE id = $1::uuid`,
+        [workerItem],
+      );
+      const restarted = startWorkerMain(fresh, freshWorker, dummyFile, { crash: false });
+      let ackedCount = 1;
+      for (let attempt = 0; attempt < 40 && ackedCount !== 0; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        const acked = await admin.query<{ n: number }>(
+          "SELECT count(*)::int AS n FROM graphile_worker._private_jobs WHERE key = $1",
+          [`credential-cleanup:${workerItem}`],
+        );
+        ackedCount = acked.rows[0]?.n ?? 1;
+      }
+      restarted.stop();
+      expect(ackedCount, restarted.output()).toBe(0);
+      const currentLeft = await admin.query<{ ciphertext: string }>(
+        "SELECT ciphertext FROM messaging_installations WHERE id = 'phase1-worker'",
+      );
+      expect(currentLeft.rows[0]?.ciphertext).toBe(workerCurrent);
+      restarted.stop();
+      await admin.query(
+        `SELECT graphile_worker.add_job(
+           'messaging.credential-cleanup'::text,
+           json_build_object('installationId', 'phase1-worker', 'ref', 'legacy-ref'),
+           NULL::text, NULL::timestamptz, 5, 'phase1-legacy-startup'::text,
+           NULL::integer, NULL::text[], 'replace'::text)`,
+      );
+      const refused = await runWorkerMain(fresh, freshWorker, dummyFile, { crash: false });
+      expect(refused.code, refused.stderr).not.toBe(0);
+      expect(refused.stderr).toContain("legacy jobs are queued");
+      const legacyRemains = await admin.query<{ n: number }>(
+        "SELECT count(*)::int AS n FROM graphile_worker._private_jobs WHERE key = 'phase1-legacy-startup'",
+      );
+      expect(legacyRemains.rows[0]?.n).toBe(1);
     } finally {
       await admin.end();
       await api.end();
@@ -306,7 +563,7 @@ it.skipIf(!databaseUrl)(
       await created.prisma.$disconnect();
     }
   },
-  120_000,
+  180_000,
 );
 
 async function sqlState(
@@ -321,52 +578,189 @@ async function sqlState(
   return "";
 }
 
-function runCleanupProcess(workerUrl: URL, workItemId: string) {
-  return new Promise<string>((resolve, reject) => {
-    execFile(
-      "pnpm",
-      ["--filter", "@rakazo/api", "exec", "tsx", "src/phase1-cleanup-once.ts"],
-      {
-        cwd: "/workspace",
-        env: {
-          ...process.env,
-          DATABASE_WORKER_URL: workerUrl.toString(),
-          PHASE1_WORK_ITEM_ID: workItemId,
-        },
-      },
-      (error, stdout, stderr) => {
-        if (error) {
-          reject(
-            new Error(
-              (stderr || stdout || error.message).replaceAll(workerUrl.toString(), "[worker]"),
-            ),
-          );
-        } else resolve(stdout.trim());
-      },
-    );
-  });
-}
-
-function runMigrate(workerUrl: URL) {
+function runMigrate(database: URL, workerUrl: URL, runtimeUrl?: URL) {
   return new Promise<void>((resolve, reject) => {
     execFile(
       "pnpm",
       ["--filter", "@rakazo/api", "db:migrate"],
       {
         cwd: "/workspace",
-        env: { ...process.env, DATABASE_WORKER_URL: workerUrl.toString() },
+        env: {
+          ...process.env,
+          DATABASE_URL: (runtimeUrl ?? database).toString(),
+          DATABASE_MIGRATION_URL: database.toString(),
+          DATABASE_WORKER_URL: workerUrl.toString(),
+        },
       },
       (error, stdout, stderr) => {
-        if (error) {
-          reject(
-            new Error(
-              (stderr || stdout || error.message).replaceAll(workerUrl.toString(), "[worker]"),
-            ),
-          );
-        } else resolve();
+        const output = `${stderr}\n${stdout}`.replaceAll(database.toString(), "[database]");
+        if (error) reject(new Error(output));
+        else resolve();
       },
     );
   });
+}
+
+function startWorkerMain(
+  database: URL,
+  workerUrl: URL,
+  dummyFile: string,
+  options: { crash: boolean },
+) {
+  let output = "";
+  const child = spawn("/workspace/node_modules/.bin/tsx", ["src/index.ts"], {
+    cwd: "/workspace/apps/worker",
+    stdio: ["ignore", "pipe", "pipe"],
+    env: {
+      ...process.env,
+      DATABASE_URL: database.toString(),
+      DATABASE_MIGRATION_URL: database.toString(),
+      DATABASE_WORKER_URL: workerUrl.toString(),
+      PHASE1_DUMMY_SECRET_STORE: dummyFile,
+      PHASE1_DUMMY_CRASH_AFTER_DELETE: options.crash ? "1" : "",
+      SANDBOX_PROVIDER: "none",
+      AGENT_RUNTIME: "scripted",
+      NODE_ENV: "test",
+      RAKAZO_ALLOW_DEV_SECRETS: "1",
+      DB_POOL_MAX: "8",
+      WAKEUP_DRIVER: "",
+    },
+  });
+  child.stdout?.on("data", (chunk) => {
+    output += chunk.toString();
+  });
+  child.stderr?.on("data", (chunk) => {
+    output += chunk.toString();
+  });
+  const stop = () => {
+    child.kill("SIGTERM");
+  };
+  const until = (pattern: RegExp) =>
+    new Promise<{ code: number | null; output: string }>((resolve) => {
+      const timer = setTimeout(() => {
+        stop();
+        resolve({ code: null, output: redact(output) });
+      }, 40_000);
+      child.on("close", (code) => {
+        clearTimeout(timer);
+        resolve({ code, output: redact(output) });
+      });
+      const poll = setInterval(() => {
+        if (pattern.test(output)) {
+          clearInterval(poll);
+          clearTimeout(timer);
+          resolve({ code: null, output: redact(output) });
+        }
+      }, 200);
+      function redact(value: string) {
+        return value
+          .replaceAll(database.toString(), "[database]")
+          .replaceAll(workerUrl.toString(), "[worker]");
+      }
+    });
+  return {
+    until,
+    stop,
+    output: () =>
+      output
+        .replaceAll(database.toString(), "[database]")
+        .replaceAll(workerUrl.toString(), "[worker]"),
+  };
+}
+
+function runWorkerMain(
+  database: URL,
+  workerUrl: URL,
+  dummyFile: string,
+  options: { crash: boolean },
+) {
+  const started = startWorkerMain(database, workerUrl, dummyFile, options);
+  return started.until(/worker startup failed|legacy jobs are queued/).then((result) => {
+    started.stop();
+    return { code: result.code ?? 1, stderr: result.output, stdout: result.output };
+  });
+}
+
+async function dropManagedWorker(adminUrl: URL): Promise<void> {
+  const pool = createPool(adminUrl.toString());
+  try {
+    const databases = await pool.query<{ datname: string }>(
+      "SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate",
+    );
+    for (const database of databases.rows) {
+      const url = new URL(adminUrl.toString());
+      url.pathname = `/${database.datname}`;
+      const owned = createPool(url.toString());
+      try {
+        await owned.query("DROP OWNED BY rakazo_credential_worker");
+      } catch {
+        // The role has no objects in this database.
+      } finally {
+        await owned.end();
+      }
+    }
+    await pool.query("DROP ROLE IF EXISTS rakazo_credential_worker");
+  } finally {
+    await pool.end();
+  }
+}
+
+async function createFreshDatabase(adminUrl: URL): Promise<URL> {
+  const name = `phase1_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
+  const pool = createPool(adminUrl.toString());
+  await pool.query(`CREATE DATABASE "${name}"`);
+  await pool.end();
+  const url = new URL(adminUrl.toString());
+  url.pathname = `/${name}`;
+  return url;
+}
+
+function loginUrl(database: URL, user: string, password: string): URL {
+  const url = new URL(database.toString());
+  url.username = user;
+  url.password = password;
+  return url;
+}
+
+async function migrationCount(database: URL): Promise<number> {
+  const present = await scalar(
+    database,
+    "SELECT CASE WHEN to_regclass('_prisma_migrations') IS NULL THEN 0 ELSE 1 END AS n",
+  );
+  if (present === 0) return 0;
+  return scalar(database, "SELECT count(*)::int AS n FROM _prisma_migrations");
+}
+
+async function scalar(database: URL, sql: string): Promise<number> {
+  const pool = createPool(database.toString());
+  try {
+    const rows = await pool.query<{ n: number }>(sql);
+    return rows.rows[0]?.n ?? 0;
+  } finally {
+    await pool.end();
+  }
+}
+
+async function seedLegacyQueue(database: URL): Promise<void> {
+  await psql(
+    database,
+    `CREATE SCHEMA queue_private;
+     CREATE TABLE queue_private.credential_retirement (
+       id uuid PRIMARY KEY,
+       installation_id text NOT NULL,
+       retired_ref text,
+       version integer NOT NULL,
+       state text NOT NULL
+     );
+     INSERT INTO queue_private.credential_retirement (id, installation_id, retired_ref, version, state)
+     VALUES
+       ('00000000-0000-4000-8000-000000000011', 'legacy', 'pending-ref', 1, 'pending'),
+       ('00000000-0000-4000-8000-000000000012', 'legacy', 'leased-ref', 1, 'leased'),
+       ('00000000-0000-4000-8000-000000000013', 'legacy', NULL, 1, 'deleted'),
+       ('00000000-0000-4000-8000-000000000014', 'legacy', NULL, 1, 'skipped_current');
+     CREATE TABLE messaging_installations (id text PRIMARY KEY, ciphertext text);
+     INSERT INTO messaging_installations (id, ciphertext) VALUES ('legacy-active', 'active-ref');`,
+  );
 }
 
 function psql(url: URL, sql: string) {

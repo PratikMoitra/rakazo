@@ -64,6 +64,15 @@ export async function preflightCredentialWorker(
     if (!here || here.db !== workerDatabase) {
       throw new Error("DATABASE_WORKER_URL must use the same database as the migration");
     }
+    const [localIdentity] = (
+      await owner.query<{ ident: string }>(
+        "SELECT system_identifier::text AS ident FROM pg_control_system()",
+      )
+    ).rows;
+    const endpoint = await probeWorkerEndpoint(migrationUrl, workerUrl);
+    if (!localIdentity || endpoint.ident !== localIdentity.ident || endpoint.db !== here.db) {
+      throw new Error("DATABASE_WORKER_URL is not the migration database");
+    }
     const reserved = new Set([QUEUE_OWNER, "rakazo_app", here.session_user, here.owner_name]);
     if (reserved.has(target.login)) {
       throw new Error("DATABASE_WORKER_URL uses a reserved database identity");
@@ -84,6 +93,38 @@ export async function preflightCredentialWorker(
       )
     ).rows;
     if (!role) return;
+    const provenance = await owner.query<{ ok: boolean }>(
+      "SELECT to_regclass('queue_private.worker_provenance') IS NOT NULL AS ok",
+    );
+    const [marked] = provenance.rows[0]?.ok
+      ? (
+          await owner.query<{ role_oid: string }>(
+            `SELECT role_oid::text FROM queue_private.worker_provenance WHERE role_name = $1`,
+            [target.login],
+          )
+        ).rows
+      : [];
+    const [oid] = (
+      await owner.query<{ id: string }>("SELECT oid::text AS id FROM pg_roles WHERE rolname = $1", [
+        target.login,
+      ])
+    ).rows;
+    if (!marked || marked.role_oid !== oid?.id) {
+      throw new Error("DATABASE_WORKER_URL names an unrelated preexisting role");
+    }
+    const memberships = await owner.query<{ n: number }>(
+      `SELECT count(*)::int AS n FROM pg_auth_members WHERE member = $1::oid OR roleid = $1::oid`,
+      [oid?.id],
+    );
+    const owns = await owner.query<{ n: number }>(
+      `SELECT count(*)::int AS n FROM pg_class WHERE relowner = $1::oid AND relkind IN ('r','p','v','m','S','f')`,
+      [oid?.id],
+    );
+    if ((memberships.rows[0]?.n ?? 0) > 0 || (owns.rows[0]?.n ?? 0) > 0) {
+      throw new Error(
+        "DATABASE_WORKER_URL role has memberships or ownership this command will not change",
+      );
+    }
     if (
       role.rolsuper ||
       role.rolbypassrls ||
@@ -99,6 +140,39 @@ export async function preflightCredentialWorker(
   }
 }
 
+function incompatible(counts: {
+  tombstones: number;
+  workItems: number;
+  fixtures: number;
+  opaqueJobs: number;
+  retirementWithoutRegistry: number;
+  activeWithoutRegistry: number;
+  rawRegistry: number;
+}): boolean {
+  return (
+    counts.tombstones +
+      counts.workItems +
+      counts.fixtures +
+      counts.opaqueJobs +
+      counts.retirementWithoutRegistry +
+      counts.activeWithoutRegistry +
+      counts.rawRegistry >
+    0
+  );
+}
+
+function refusal(counts: {
+  tombstones: number;
+  workItems: number;
+  fixtures: number;
+  opaqueJobs: number;
+  retirementWithoutRegistry: number;
+  activeWithoutRegistry: number;
+  rawRegistry: number;
+}): string {
+  return `credential cleanup upgrade refused: tombstones=${counts.tombstones} workItems=${counts.workItems} fixtures=${counts.fixtures} opaqueJobs=${counts.opaqueJobs} retirementWithoutRegistry=${counts.retirementWithoutRegistry} activeWithoutRegistry=${counts.activeWithoutRegistry} rawRegistry=${counts.rawRegistry}`;
+}
+
 /** Counts only. Does not delete or rewrite jobs. A nonzero count must refuse startup. */
 export async function preflightQueueBoundary(migrationUrl: string): Promise<{
   tombstones: number;
@@ -110,11 +184,7 @@ export async function preflightQueueBoundary(migrationUrl: string): Promise<{
   await owner.connect();
   try {
     const counts = await legacyQueueCounts(owner);
-    if (counts.tombstones + counts.workItems + counts.fixtures + counts.opaqueJobs > 0) {
-      throw new Error(
-        `credential cleanup upgrade refused: tombstones=${counts.tombstones} workItems=${counts.workItems} fixtures=${counts.fixtures} opaqueJobs=${counts.opaqueJobs}`,
-      );
-    }
+    if (incompatible(counts)) throw new Error(refusal(counts));
     return counts;
   } finally {
     await owner.end();
@@ -130,11 +200,7 @@ export async function installQueueBoundary(migrationUrl: string): Promise<void> 
     );
     if (!ready.rows[0]?.ready) throw new Error("queue boundary needs the job schema");
     const prior = await legacyQueueCounts(owner);
-    if (prior.tombstones + prior.workItems + prior.fixtures + prior.opaqueJobs > 0) {
-      throw new Error(
-        `credential cleanup upgrade refused: tombstones=${prior.tombstones} workItems=${prior.workItems} fixtures=${prior.fixtures} opaqueJobs=${prior.opaqueJobs}`,
-      );
-    }
+    if (incompatible(prior)) throw new Error(refusal(prior));
     await owner.query(BOUNDARY_SQL);
     await grantDefinerQueueAccess(owner);
   } finally {
@@ -167,6 +233,12 @@ export async function provisionCredentialWorker(
       await owner.query(
         `CREATE ROLE ${name} LOGIN ${secret} NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE`,
       );
+      await owner.query(
+        `INSERT INTO queue_private.worker_provenance (role_name, role_oid)
+         SELECT $1::text, oid FROM pg_roles WHERE rolname = $1::text
+         ON CONFLICT (role_name) DO UPDATE SET role_oid = EXCLUDED.role_oid`,
+        [login],
+      );
     } else if (existing.rows[0]?.rolcanlogin) {
       await owner.query(
         `ALTER ROLE ${name} PASSWORD ${escapeLiteral(scramSha256Verifier(password))}`,
@@ -184,7 +256,8 @@ export async function provisionCredentialWorker(
         queue_api.renew_credential_lease(uuid, uuid),
         queue_api.complete_credential_retirement(uuid, uuid),
         queue_api.redact_dispatch_errors(),
-        queue_api.purge_redacted_retirements(integer)
+        queue_api.purge_redacted_retirements(integer),
+        queue_api.purge_dummy_orphans()
       TO ${name}
     `);
     await owner.query(
@@ -201,7 +274,8 @@ export async function provisionCredentialWorker(
         queue_api.renew_credential_lease(uuid, uuid),
         queue_api.complete_credential_retirement(uuid, uuid),
         queue_api.redact_dispatch_errors(),
-        queue_api.purge_redacted_retirements(integer)
+        queue_api.purge_redacted_retirements(integer),
+        queue_api.purge_dummy_orphans()
       FROM PUBLIC, rakazo_app
     `);
   } finally {
@@ -246,8 +320,11 @@ async function grantDefinerQueueAccess(owner: Client): Promise<void> {
     "complete_credential_retirement(uuid, uuid)",
     "redact_dispatch_errors()",
     "purge_redacted_retirements(integer)",
-    "register_active_credential(text)",
-    "record_orphan_credential(text)",
+    "purge_dummy_orphans()",
+    "register_active_credential(text, text)",
+    "record_orphan_credential(text, text, text)",
+    "credential_fingerprint(text)",
+    "lock_credential_fingerprint(text)",
     "credential_object_is_attachable()",
   ]) {
     await owner.query(`ALTER FUNCTION queue_api.${name} OWNER TO ${QUEUE_OWNER}`);
@@ -273,6 +350,41 @@ function loginOf(url: string): string {
   return decodeURIComponent(new URL(url).username);
 }
 
+async function probeWorkerEndpoint(
+  migrationUrl: string,
+  workerUrl: string,
+): Promise<{ ident: string; db: string }> {
+  const worker = new URL(workerUrl);
+  const probe = new URL(migrationUrl);
+  probe.hostname = worker.hostname;
+  probe.port = worker.port;
+  probe.pathname = worker.pathname;
+  const client = new Client({
+    connectionString: probe.toString(),
+    connectionTimeoutMillis: 3000,
+  });
+  try {
+    await client.connect();
+    const [row] = (
+      await client.query<{ ident: string; db: string }>(
+        "SELECT system_identifier::text AS ident, current_database() AS db FROM pg_control_system()",
+      )
+    ).rows;
+    if (!row) throw new Error("DATABASE_WORKER_URL is not the migration database");
+    return row;
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      error.message === "DATABASE_WORKER_URL is not the migration database"
+    ) {
+      throw error;
+    }
+    throw new Error("DATABASE_WORKER_URL is not the migration database");
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
 function databaseName(url: string): string {
   const name = decodeURIComponent(new URL(url).pathname.replace(/^\//, ""));
   if (!name) throw new Error("DATABASE_WORKER_URL must name a database");
@@ -284,6 +396,9 @@ async function legacyQueueCounts(owner: Client): Promise<{
   workItems: number;
   fixtures: number;
   opaqueJobs: number;
+  retirementWithoutRegistry: number;
+  activeWithoutRegistry: number;
+  rawRegistry: number;
 }> {
   const tableCount = async (regclass: string) => {
     const exists = await owner.query<{ ok: boolean }>("SELECT to_regclass($1) IS NOT NULL AS ok", [
@@ -330,7 +445,56 @@ async function legacyQueueCounts(owner: Client): Promise<{
     );
     opaqueJobs = rows.rows[0]?.n ?? 0;
   }
-  return { tombstones, workItems, fixtures, opaqueJobs };
+  let retirementWithoutRegistry = 0;
+  const retirement = await owner.query<{ ok: boolean }>(
+    "SELECT to_regclass('queue_private.credential_retirement') IS NOT NULL AS ok",
+  );
+  const fingerprint = await owner.query<{ ok: boolean }>(
+    "SELECT to_regclass('queue_private.credential_fingerprint') IS NOT NULL AS ok",
+  );
+  if (retirement.rows[0]?.ok) {
+    const rows = await owner.query<{ n: number }>(
+      fingerprint.rows[0]?.ok
+        ? `SELECT count(*)::int AS n FROM queue_private.credential_retirement AS retirement
+           WHERE retirement.state IN ('pending', 'leased')
+             AND NOT EXISTS (
+               SELECT 1 FROM queue_private.credential_fingerprint AS item
+               WHERE item.retirement_id = retirement.id AND item.state = 'retiring'
+             )`
+        : "SELECT count(*)::int AS n FROM queue_private.credential_retirement",
+    );
+    retirementWithoutRegistry = rows.rows[0]?.n ?? 0;
+  }
+  let activeWithoutRegistry = 0;
+  const installations = await owner.query<{ ok: boolean }>(
+    "SELECT to_regclass('public.messaging_installations') IS NOT NULL AS ok",
+  );
+  if (installations.rows[0]?.ok) {
+    const rows = await owner.query<{ n: number }>(
+      fingerprint.rows[0]?.ok
+        ? `SELECT count(*)::int AS n FROM messaging_installations AS installation
+           WHERE length(installation.ciphertext) > 0
+             AND NOT EXISTS (
+               SELECT 1 FROM queue_private.credential_fingerprint AS item
+               WHERE item.object_id = queue_api.credential_fingerprint(installation.ciphertext)
+                 AND item.state = 'active'
+                 AND item.installation_id = installation.id
+             )`
+        : `SELECT count(*)::int AS n FROM messaging_installations
+           WHERE length(ciphertext) > 0`,
+    );
+    activeWithoutRegistry = rows.rows[0]?.n ?? 0;
+  }
+  const rawRegistry = await tableCount("queue_private.credential_object");
+  return {
+    tombstones,
+    workItems,
+    fixtures,
+    opaqueJobs,
+    retirementWithoutRegistry,
+    activeWithoutRegistry,
+    rawRegistry,
+  };
 }
 
 const BOUNDARY_SQL = `
@@ -352,15 +516,41 @@ DROP FUNCTION IF EXISTS queue_api.claim_retired_credential(uuid, text);
 DROP FUNCTION IF EXISTS queue_api.complete_credential_cleanup(uuid);
 DROP FUNCTION IF EXISTS queue_api.rehearse_legacy_fixtures();
 
-CREATE TABLE IF NOT EXISTS queue_private.credential_object (
-  object_key text PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS queue_private.credential_fingerprint (
+  object_id bytea PRIMARY KEY,
+  installation_id text NOT NULL,
   state text NOT NULL,
   generation integer NOT NULL,
   retirement_id uuid,
-  CONSTRAINT credential_object_state_check CHECK (state IN ('active', 'retiring', 'retired', 'orphan'))
+  created_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT credential_fingerprint_state_check CHECK (state IN ('active', 'retiring', 'retired', 'orphan'))
 );
-ALTER TABLE queue_private.credential_object OWNER TO ${QUEUE_OWNER};
-REVOKE ALL ON TABLE queue_private.credential_object FROM PUBLIC, rakazo_app;
+ALTER TABLE queue_private.credential_fingerprint OWNER TO ${QUEUE_OWNER};
+REVOKE ALL ON TABLE queue_private.credential_fingerprint FROM PUBLIC, rakazo_app;
+
+CREATE TABLE IF NOT EXISTS queue_private.credential_orphan (
+  id uuid PRIMARY KEY,
+  object_id bytea NOT NULL,
+  raw_ref text NOT NULL,
+  installation_id text,
+  record_id text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  retain_until timestamptz NOT NULL
+);
+ALTER TABLE queue_private.credential_orphan OWNER TO ${QUEUE_OWNER};
+REVOKE ALL ON TABLE queue_private.credential_orphan FROM PUBLIC, rakazo_app;
+
+CREATE TABLE IF NOT EXISTS queue_private.worker_provenance (
+  role_name text PRIMARY KEY,
+  role_oid oid NOT NULL
+);
+ALTER TABLE queue_private.worker_provenance OWNER TO ${QUEUE_OWNER};
+
+CREATE TABLE IF NOT EXISTS queue_private.boundary_version (
+  version integer PRIMARY KEY
+);
+INSERT INTO queue_private.boundary_version (version) VALUES (2) ON CONFLICT DO NOTHING;
+ALTER TABLE queue_private.boundary_version OWNER TO ${QUEUE_OWNER};
 
 CREATE TABLE IF NOT EXISTS queue_private.credential_retirement (
   id uuid PRIMARY KEY,
@@ -394,6 +584,13 @@ BEGIN
   IF installation_id IS NULL OR length(installation_id) < 1 OR length(installation_id) > 200 THEN
     RAISE EXCEPTION 'invalid installation' USING ERRCODE = '22023';
   END IF;
+  SELECT ciphertext INTO current_ref
+  FROM public.messaging_installations
+  WHERE id = installation_id;
+  IF current_ref IS NULL OR length(current_ref) < 1 THEN
+    RAISE EXCEPTION 'installation has no credential' USING ERRCODE = '22023';
+  END IF;
+  PERFORM queue_api.lock_credential_fingerprint(current_ref);
   SELECT ciphertext INTO current_ref
   FROM public.messaging_installations
   WHERE id = installation_id
@@ -437,11 +634,14 @@ BEGIN
   IF current_ref IS NOT NULL AND current_ref = stored THEN
     RAISE EXCEPTION 'retirement is still the current credential' USING ERRCODE = '22023';
   END IF;
-  INSERT INTO queue_private.credential_object (object_key, state, generation, retirement_id)
-  VALUES (stored, 'retiring', 1, item_id)
-  ON CONFLICT (object_key) DO UPDATE
+  PERFORM queue_api.lock_credential_fingerprint(stored);
+  INSERT INTO queue_private.credential_fingerprint
+    (object_id, installation_id, state, generation, retirement_id)
+  VALUES (queue_api.credential_fingerprint(stored), installation, 'retiring', 1, item_id)
+  ON CONFLICT (object_id) DO UPDATE
     SET state = 'retiring', retirement_id = EXCLUDED.retirement_id
-    WHERE queue_private.credential_object.state = 'active';
+    WHERE queue_private.credential_fingerprint.state = 'active'
+      AND queue_private.credential_fingerprint.installation_id = EXCLUDED.installation_id;
   PERFORM graphile_worker.add_job(
     'work.dispatch'::text,
     json_build_object('workItemId', item_id)::json,
@@ -457,8 +657,9 @@ BEGIN
 END
 $fn$;
 
+DROP FUNCTION IF EXISTS queue_api.claim_credential_retirement(uuid);
 CREATE OR REPLACE FUNCTION queue_api.claim_credential_retirement(item_id uuid)
-RETURNS TABLE (installation_id text, retired_ref text, fence uuid)
+RETURNS TABLE (status text, installation_id text, retired_ref text, fence uuid)
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog
@@ -476,10 +677,19 @@ BEGIN
   FROM queue_private.credential_retirement AS retirement
   WHERE retirement.id = item_id
   FOR UPDATE;
-  IF inst IS NULL OR stored IS NULL OR current_state IN ('deleted', 'skipped_current') THEN
+  IF inst IS NULL THEN
+    status := 'missing';
+    RETURN NEXT;
+    RETURN;
+  END IF;
+  IF stored IS NULL OR current_state IN ('deleted', 'skipped_current') THEN
+    status := 'terminal';
+    RETURN NEXT;
     RETURN;
   END IF;
   IF current_state = 'leased' AND held_until IS NOT NULL AND held_until > clock_timestamp() THEN
+    status := 'busy';
+    RETURN NEXT;
     RETURN;
   END IF;
   SELECT ciphertext INTO current_ref
@@ -490,17 +700,22 @@ BEGIN
     SET state = 'skipped_current', retired_ref = NULL, redacted_at = clock_timestamp(),
         lease_fence = NULL, leased_until = NULL
     WHERE id = item_id;
+    status := 'terminal';
+    RETURN NEXT;
     RETURN;
   END IF;
-  PERFORM 1 FROM queue_private.credential_object
-  WHERE object_key = stored AND state = 'retiring';
+  PERFORM 1 FROM queue_private.credential_fingerprint
+  WHERE object_id = queue_api.credential_fingerprint(stored) AND state = 'retiring';
   IF NOT FOUND THEN
+    status := 'missing';
+    RETURN NEXT;
     RETURN;
   END IF;
   UPDATE queue_private.credential_retirement
   SET state = 'leased', lease_fence = next_fence,
       leased_until = clock_timestamp() + make_interval(secs => ${CREDENTIAL_RETIREMENT_LEASE_SECONDS})
   WHERE id = item_id;
+  status := 'ready';
   installation_id := inst;
   retired_ref := stored;
   fence := next_fence;
@@ -524,7 +739,7 @@ BEGIN
     AND leased_until > clock_timestamp();
   GET DIAGNOSTICS updated = ROW_COUNT;
   IF updated = 1 THEN
-    UPDATE queue_private.credential_object
+    UPDATE queue_private.credential_fingerprint
     SET state = 'retired'
     WHERE retirement_id = item_id AND state = 'retiring';
     RETURN;
@@ -598,26 +813,73 @@ BEGIN
 END
 $fn$;
 
-DROP FUNCTION IF EXISTS queue_api.register_active_credential(text);
-CREATE OR REPLACE FUNCTION queue_api.register_active_credential(p_object_key text)
+CREATE OR REPLACE FUNCTION queue_api.purge_dummy_orphans()
 RETURNS integer
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog
 AS $fn$
 DECLARE
-  current_state text;
+  removed integer;
 BEGIN
-  IF p_object_key IS NULL OR length(p_object_key) < 1 OR length(p_object_key) > 2000 THEN
+  DELETE FROM queue_private.credential_orphan
+  WHERE retain_until < clock_timestamp();
+  GET DIAGNOSTICS removed = ROW_COUNT;
+  RETURN removed;
+END
+$fn$;
+
+DROP FUNCTION IF EXISTS queue_api.register_active_credential(text);
+CREATE OR REPLACE FUNCTION queue_api.credential_fingerprint(p_object_key text)
+RETURNS bytea
+LANGUAGE sql
+IMMUTABLE
+SET search_path = pg_catalog
+AS $fn$
+  SELECT sha256(convert_to('rakazo-credential-object-v1:' || p_object_key, 'UTF8'));
+$fn$;
+
+CREATE OR REPLACE FUNCTION queue_api.lock_credential_fingerprint(p_object_key text)
+RETURNS bytea
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $fn$
+DECLARE
+  fp bytea := queue_api.credential_fingerprint(p_object_key);
+BEGIN
+  PERFORM pg_advisory_xact_lock(hashtextextended(encode(fp, 'hex'), 0));
+  RETURN fp;
+END
+$fn$;
+
+DROP FUNCTION IF EXISTS queue_api.register_active_credential(text);
+DROP FUNCTION IF EXISTS queue_api.register_active_credential(text, text);
+CREATE OR REPLACE FUNCTION queue_api.register_active_credential(p_installation_id text, p_object_key text)
+RETURNS integer
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $fn$
+DECLARE
+  fp bytea;
+  current_state text;
+  bound_installation text;
+BEGIN
+  IF p_installation_id IS NULL OR length(p_installation_id) < 1
+     OR p_object_key IS NULL OR length(p_object_key) < 1 OR length(p_object_key) > 2000 THEN
     RAISE EXCEPTION 'invalid credential object' USING ERRCODE = '22023';
   END IF;
-  INSERT INTO queue_private.credential_object (object_key, state, generation)
-  VALUES (p_object_key, 'active', 1)
-  ON CONFLICT (object_key) DO NOTHING;
-  SELECT state INTO current_state
-  FROM queue_private.credential_object
-  WHERE credential_object.object_key = p_object_key;
-  IF current_state IS DISTINCT FROM 'active' THEN
+  fp := queue_api.lock_credential_fingerprint(p_object_key);
+  INSERT INTO queue_private.credential_fingerprint
+    (object_id, installation_id, state, generation)
+  VALUES (fp, p_installation_id, 'active', 1)
+  ON CONFLICT (object_id) DO NOTHING;
+  SELECT state, installation_id INTO current_state, bound_installation
+  FROM queue_private.credential_fingerprint
+  WHERE object_id = fp
+  FOR UPDATE;
+  IF current_state IS DISTINCT FROM 'active' OR bound_installation IS DISTINCT FROM p_installation_id THEN
     RAISE EXCEPTION 'credential object cannot be reused' USING ERRCODE = '23514';
   END IF;
   RETURN 1;
@@ -625,27 +887,41 @@ END
 $fn$;
 
 DROP FUNCTION IF EXISTS queue_api.record_orphan_credential(text);
-CREATE OR REPLACE FUNCTION queue_api.record_orphan_credential(p_object_key text)
+CREATE OR REPLACE FUNCTION queue_api.record_orphan_credential(
+  p_object_key text,
+  p_installation_id text,
+  p_record_id text
+)
 RETURNS integer
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog
 AS $fn$
 DECLARE
+  fp bytea;
   current_state text;
 BEGIN
   IF p_object_key IS NULL OR length(p_object_key) < 1 OR length(p_object_key) > 2000 THEN
     RAISE EXCEPTION 'invalid credential object' USING ERRCODE = '22023';
   END IF;
-  INSERT INTO queue_private.credential_object (object_key, state, generation)
-  VALUES (p_object_key, 'orphan', 1)
-  ON CONFLICT (object_key) DO NOTHING;
+  fp := queue_api.lock_credential_fingerprint(p_object_key);
+  INSERT INTO queue_private.credential_fingerprint
+    (object_id, installation_id, state, generation)
+  VALUES (fp, coalesce(p_installation_id, ''), 'orphan', 1)
+  ON CONFLICT (object_id) DO NOTHING;
   SELECT state INTO current_state
-  FROM queue_private.credential_object
-  WHERE credential_object.object_key = p_object_key;
+  FROM queue_private.credential_fingerprint
+  WHERE object_id = fp
+  FOR UPDATE;
   IF current_state = 'active' THEN
     RAISE EXCEPTION 'credential object is active' USING ERRCODE = '23514';
   END IF;
+  INSERT INTO queue_private.credential_orphan
+    (id, object_id, raw_ref, installation_id, record_id, retain_until)
+  VALUES (
+    gen_random_uuid(), fp, p_object_key, p_installation_id, p_record_id,
+    clock_timestamp() + interval '1 hour'
+  );
   RETURN 1;
 END
 $fn$;
@@ -656,14 +932,20 @@ LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog
 AS $fn$
+DECLARE
+  fp bytea;
+  current_state text;
+  bound_installation text;
 BEGIN
   IF NEW.ciphertext IS NULL OR length(NEW.ciphertext) = 0 THEN
     RETURN NEW;
   END IF;
-  IF NOT EXISTS (
-    SELECT 1 FROM queue_private.credential_object
-    WHERE object_key = NEW.ciphertext AND state = 'active'
-  ) THEN
+  fp := queue_api.lock_credential_fingerprint(NEW.ciphertext);
+  SELECT state, installation_id INTO current_state, bound_installation
+  FROM queue_private.credential_fingerprint
+  WHERE object_id = fp
+  FOR UPDATE;
+  IF current_state IS DISTINCT FROM 'active' OR bound_installation IS DISTINCT FROM NEW.id THEN
     RAISE EXCEPTION 'credential object is not an active generation' USING ERRCODE = '23514';
   END IF;
   RETURN NEW;
@@ -680,7 +962,7 @@ GRANT USAGE ON SCHEMA queue_api TO rakazo_app;
 GRANT EXECUTE ON FUNCTION
   queue_api.capture_current_credential(text),
   queue_api.enqueue_captured_credential(uuid),
-  queue_api.register_active_credential(text),
-  queue_api.record_orphan_credential(text)
+  queue_api.register_active_credential(text, text),
+  queue_api.record_orphan_credential(text, text, text)
 TO rakazo_app;
 `;

@@ -10,6 +10,7 @@ import {
   deployMigrations,
   installQueueBoundary,
   preflightCredentialWorker,
+  preflightQueueBoundary,
   provisionCredentialWorker,
   provisionRuntimeRole,
   RUNTIME_ROLE,
@@ -23,6 +24,7 @@ const credentialWorker = credentialWorkerTarget(urls.url, process.env.DATABASE_W
 if (credentialWorker.mode === "on") {
   await preflightCredentialWorker(urls.migrationUrl, credentialWorker.url);
 }
+await preflightQueueBoundary(urls.migrationUrl);
 await deployMigrations({
   migrationUrl: urls.migrationUrl,
   previousMigrations: process.env.RAKAZO_DEPLOYED_MIGRATIONS?.split(","),

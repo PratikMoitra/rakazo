@@ -13,6 +13,7 @@ import { getLogger, runCorrelatedJob, unwrapJobPayload, wrapJobPayload } from "@
 import type { Runner, WorkerUtils } from "graphile-worker";
 import { makeWorkerUtils, run } from "graphile-worker";
 import type { Pool } from "pg";
+import { cleanupErrorCode } from "./credential-cleanup.js";
 import { recordHistoryCompactAttemptsExhausted } from "./history-compaction.js";
 import { RunExecutionHost } from "./run-execution.js";
 
@@ -341,7 +342,12 @@ export class GraphileJobWorkerHost implements JobWorkerHost {
         try {
           await dispatchJob(handlers, "messaging.credential-cleanup", { workItemId });
         } catch (error) {
-          if (error instanceof Error && error.message === "work_rejected") throw error;
+          if (
+            error instanceof Error &&
+            (error.message === "work_rejected" || cleanupErrorCode(error.message))
+          ) {
+            throw error;
+          }
           throw new Error("credential_cleanup_failed");
         }
       };

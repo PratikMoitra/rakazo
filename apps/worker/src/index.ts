@@ -277,8 +277,10 @@ async function main() {
     legacyMessaging,
     jobs,
     {
-      register: (tx, objectKey) => registerActiveCredential(tx, objectKey),
-      recordOrphan: (objectKey) => recordOrphanCredential(prisma, objectKey),
+      register: (tx, installationId, objectKey) =>
+        registerActiveCredential(tx, installationId, objectKey),
+      recordOrphan: (objectKey, installationId, recordId) =>
+        recordOrphanCredential(prisma, objectKey, installationId, recordId),
       ...(credentialWorker.mode === "on"
         ? {
             retirement: {
@@ -536,6 +538,7 @@ async function main() {
 // realtime, all keyed by ids rather than a signed-in user. This is its one
 // row-level security bypass; jobs re-enter it explicitly (see wakeup.ts).
 runAsSystem("worker process", main).catch(async (error) => {
+  process.stderr.write(`${error instanceof Error ? error.message : "worker startup failed"}\n`);
   logger.error("worker startup failed", error);
   await logger.flush({ timeoutMs: 2_000 });
   // jobHost.start retries 53300 without bound above, so a saturated Postgres at

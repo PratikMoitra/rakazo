@@ -33,16 +33,26 @@ The signed-in RPC body ceiling for a 26214400-byte file is 36001112 bytes. The l
 
 ## Queue boundary, credential cleanup only
 
-Credential cleanup copies the reference stored on the installation inside the rotation or disconnect transaction. The queue payload is `{workItemId}`. The reference lives in `queue_private.credential_retirement` until the worker finishes, then it is cleared. The functions are owned by `rakazo_queue_owner`, which is NOLOGIN, NOSUPERUSER, and NOBYPASSRLS. The API login can capture and enqueue. It cannot claim or read the retirement table. `pnpm db:migrate` reads the worker URL before it changes roles. The only login it creates is `rakazo_credential_worker`. A reserved, blank, same-login, or wrong-database value is rejected without altering roles. The queue owner stays NOLOGIN. The installer does not drop an older retirement table. If that table or an older opaque job still has rows, migrate stops before DDL. Legacy raw-reference jobs are counted and left in place; the worker then refuses to start. They are not converted or deleted.
+The permanent no-reuse key is `sha256` of the domain string `rakazo-credential-object-v1:` plus the object reference. The raw reference stays on a non-terminal `credential_retirement` row and, for an uncommitted object, on `credential_orphan` until `retain_until` (one hour). `purge_dummy_orphans` deletes expired orphan rows only. It does not delete an external secret. That is a dummy bound, not an alert, a backlog age, or a cleanup SLA. Real orphan accumulation is not accepted. Rotation and disconnect still throw before creating work when the worker URL is unset.
 
-The runtime login still has Graphile access for every other job. That is unresolved. This slice does not revoke those grants.
+Attach, capture, enqueue, and the installation trigger take `pg_advisory_xact_lock` on that fingerprint and then lock the fingerprint row, through commit. A second connection's restore insert waited on an uncommitted retiring update and then failed with SQLSTATE 23514. The API login cannot disable that trigger, set `session_replication_role` to `replica`, `SET ROLE` to the queue owner, or update the fingerprint table (SQLSTATE 42501). A database owner can still bypass this. It is not DBA-proof.
 
-The chunk-size and partial-body checks use a custom Node bridge. The production HTTP adapter was exercised with one 32-byte chunked upload. That does not cover the 26214400-byte boundary, abort, or parser rejection. The Graphile host used in earlier notes ran in the test process. A later cleanup check starts a separate OS process for one synthetic delete. There is no alert, backlog age, or cleanup SLA when the worker URL is unset: rotation and disconnect are rejected instead, and an uncommitted new object is recorded as an orphan without being deleted.
+Claim returns `ready`, `busy`, `terminal`, or `missing`. A busy lease, a renewal that changes 0 rows, and a missing fingerprint throw `credential_cleanup_retry` or `credential_cleanup_invariant`. They are not success. Setting `leased_until` in the past let another claim take the row; the old fence renewed 0 rows. A delete that then threw left the secret gone and the row leased; after the lease was set in the past, the next attempt treated `not_found` as already deleted and completed. That is not an exactly-once external delete.
+
+`pnpm --filter @rakazo/api db:migrate` runs the legacy-state preflight before Prisma DDL. On a fresh database, pending, leased, deleted, and skipped retirement rows plus one active ciphertext were left in place, and `_prisma_migrations` was not created. No converter and no delete runs to clear that guard. An existing `rakazo_credential_worker` role with no provenance row in that database was not altered: its password hash compared equal, and no migrations were written. The endpoint check connects with the migration login to the worker URL's host, port, and database and compares `system_identifier`. It does not trust the URL string alone.
+
+The worker check starts `apps/worker/src/index.ts` through `tsx`. `PHASE1_DUMMY_SECRET_STORE` points that process at a file. One process deleted the retired object and exited 75. After the test cleared the Graphile lock and set the product lease in the past, a second process of the same entrypoint acknowledged the job. The current ciphertext remained. A committed legacy raw-reference job was left in the queue, and the next start exited non-zero with `legacy jobs are queued`. `apps/api/src/phase1-cleanup-once.ts` is not this evidence.
+
+The runtime login still has Graphile access for every other job when migrate provisions separate URLs. That all-job gap stays open. This slice does not revoke those grants and is not a pattern for the other jobs.
+
+The chunk-size and partial-body checks use a custom Node bridge. The production HTTP adapter was exercised with one 32-byte chunked upload. That does not cover the 26214400-byte boundary, abort, or parser rejection.
 
 ## Untested
 
 - The installed phone build. Source tests are not device compatibility.
 - A file written into a running computer container, including byte count, hash, and ownership. No disposable Docker daemon was available. The production daemon was not used.
 - Host-computer transfers above 8 MiB. Those caps stay 8 MiB per file and 12 MiB per message.
-- Production databases. The additive migrations were applied only to the disposable database.
-- Moving every remaining background job onto the opaque dispatcher and leaving the runtime queue grants revoked. Credential cleanup is the path that moved.
+- Production databases. The additive migrations were applied only to disposable databases.
+- Moving every remaining background job onto the opaque dispatcher and leaving the runtime queue grants revoked.
+- The shared disposable database still has retirement rows without a fingerprint registry, active ciphertext without one, and the old raw registry. Migrate refuses it. The messaging installation Postgres suite calls the installer there and does not run. Those rows were not deleted.
+

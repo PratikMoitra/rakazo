@@ -477,8 +477,10 @@ async function buildApp(overrides: CreateAppOverrides): Promise<AppHandles> {
   const { messaging, installations: messagingInstallations } = messagingOverride
     ? { messaging: messagingOverride, installations: undefined }
     : installedMessaging(prisma, secrets, env, legacyMessaging, jobs, {
-        register: (tx, objectKey) => registerActiveCredential(tx, objectKey),
-        recordOrphan: (objectKey) => recordOrphanCredential(prisma, objectKey),
+        register: (tx, installationId, objectKey) =>
+          registerActiveCredential(tx, installationId, objectKey),
+        recordOrphan: (objectKey, installationId, recordId) =>
+          recordOrphanCredential(prisma, objectKey, installationId, recordId),
         ...(credentialWorkerTarget(env.databaseUrl, process.env.DATABASE_WORKER_URL).mode === "on"
           ? {
               retirement: {
