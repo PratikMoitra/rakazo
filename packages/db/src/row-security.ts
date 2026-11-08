@@ -173,9 +173,12 @@ export const ROW_SECURITY_MODELS: ReadonlySet<string> = new Set([
  * cannot read it, so SQL that runs for a tenant cannot turn the bypass on itself.
  * Derived from the runtime login's password, so it needs no setting of its own.
  */
-export function rlsBypassKey(connectionString: string | undefined): string {
-  const { password } = credentials(connectionString);
+export function rlsBypassKeyForPassword(password: string): string {
   return password ? createHmac("sha256", password).update("rakazo rls bypass").digest("hex") : "";
+}
+
+export function rlsBypassKey(connectionString: string | undefined): string {
+  return rlsBypassKeyForPassword(credentials(connectionString).password);
 }
 
 // As pg-connection-string reads them: query parameters win over the URL's userinfo, and a
@@ -227,10 +230,12 @@ async function applySettings(client: PoolClient, settings: Settings): Promise<vo
  * connection only gets a round trip when its settings change, and a checkout
  * with no context clears what an earlier one left behind.
  */
-export function installDbContext(pool: Pool): void {
-  const { connectionString } = pool.options;
-  const bypassKey = rlsBypassKey(connectionString);
-  if (bypassKey) bypassKeys.set(credentials(connectionString).user, bypassKey);
+export function installDbContext(pool: Pool, login?: { user: string; password: string }): void {
+  const bypassKey = login
+    ? rlsBypassKeyForPassword(login.password)
+    : rlsBypassKey(pool.options.connectionString);
+  const user = login?.user ?? credentials(pool.options.connectionString).user;
+  if (bypassKey && user) bypassKeys.set(user, bypassKey);
   type ConnectCallback = (
     err: Error | undefined,
     client: PoolClient | undefined,

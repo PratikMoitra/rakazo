@@ -2,7 +2,7 @@ import type { BackgroundJob, BackgroundJobHandlers } from "@rakazo/adapter-kit";
 import { messagingDeliverJob, routineWakeupJob } from "@rakazo/adapter-kit";
 import type { PrismaClient } from "@rakazo/db";
 import { createPool, currentDbContext, runAsTenant } from "@rakazo/db";
-import { Pool } from "pg";
+import type { Pool } from "pg";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createDeadJobPruner,
@@ -17,7 +17,7 @@ const describePostgres =
 
 let pool: Pool | undefined;
 function testPool(): Pool {
-  pool ??= new Pool({ connectionString: databaseUrl, max: 4 });
+  pool ??= createPool(databaseUrl!, { poolMax: 4 });
   return pool;
 }
 afterEach(async () => {

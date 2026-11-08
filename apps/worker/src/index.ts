@@ -97,6 +97,7 @@ import {
 } from "@rakazo/adapters";
 import { resolveEncryptionKey, resolveSupervisorToken, uploadLimitFromEnv } from "@rakazo/core";
 import {
+  assertFixtureDatabaseEnv,
   countLegacyCredentialJobs,
   createBoardEvents,
   createDb,
@@ -124,6 +125,7 @@ const logger = await createRootLogger(SERVICE_NAMES.worker);
 
 export async function startWorker(options?: { secretStore?: SecretStore }) {
   rejectPhase1FixtureFlags(process.env);
+  assertFixtureDatabaseEnv(process.env);
   const stopStallWatch = watchEventLoopStalls();
   const databaseUrl = process.env.DATABASE_URL;
   if (!databaseUrl) throw new Error("DATABASE_URL is required");

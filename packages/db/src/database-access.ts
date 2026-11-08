@@ -1,5 +1,7 @@
 import { createHash, createHmac, pbkdf2Sync, randomBytes } from "node:crypto";
-import { Client, escapeIdentifier, escapeLiteral } from "pg";
+import type { Client } from "pg";
+import { escapeIdentifier, escapeLiteral } from "pg";
+import { fixtureConnectionPlan, openFixtureClient } from "./fixture-transport.js";
 import type { PrismaClient } from "./generated/prisma/client.js";
 import { rlsBypassKey, runAsSystem } from "./row-security.js";
 
@@ -41,14 +43,17 @@ export const SINGLE_DATABASE_URL_WARNING =
 export async function provisionRuntimeRole(
   migrationUrl: string,
   runtimeUrl: string,
+  open: (url: string) => Client = openFixtureClient,
 ): Promise<{ warning?: string }> {
-  const owner = new Client({ connectionString: migrationUrl });
+  fixtureConnectionPlan(migrationUrl);
+  fixtureConnectionPlan(runtimeUrl);
+  const owner = open(migrationUrl);
   await owner.connect();
   try {
     const provisioned = await provisionWith(owner, runtimeUrl);
     if (provisioned.warning) return provisioned;
     // A key from a password the login does not have would lock out the running release.
-    const runtime = new Client({ connectionString: runtimeUrl });
+    const runtime = open(runtimeUrl);
     const connected = await runtime.connect().then(
       () => true,
       () => false,
@@ -68,9 +73,9 @@ export async function provisionRuntimeRole(
 }
 
 async function provisionWith(owner: Client, runtimeUrl: string): Promise<{ warning?: string }> {
-  const parsed = new URL(runtimeUrl);
-  const login = decodeURIComponent(parsed.username);
-  const password = decodeURIComponent(parsed.password);
+  const plan = fixtureConnectionPlan(runtimeUrl);
+  const login = plan.user;
+  const password = plan.password;
   if (!login) throw new Error("DATABASE_URL must name the runtime login");
   // The migration creates the role and grants too; repeating them here covers a
   // restore into a fresh cluster (roles are not in a database dump) and tables
@@ -216,8 +221,12 @@ export const JOB_QUEUE_POLICY = "rakazo_app_queue";
  * are covered and a hand-made policy of the same name is replaced by this definition.
  */
 /** Re-apply the runtime queue grants. Disposable tests restore them after a revoke rehearsal. */
-export async function restoreRuntimeQueueGrants(migrationUrl: string): Promise<void> {
-  const owner = new Client({ connectionString: migrationUrl });
+export async function restoreRuntimeQueueGrants(
+  migrationUrl: string,
+  open: (url: string) => Client = openFixtureClient,
+): Promise<void> {
+  fixtureConnectionPlan(migrationUrl);
+  const owner = open(migrationUrl);
   await owner.connect();
   try {
     await grantJobQueue(owner);
@@ -299,6 +308,22 @@ export async function describeRowSecurity(prisma: PrismaClient): Promise<RowSecu
     () => prisma.$queryRaw<Array<{ ok: boolean }>>`SELECT app_rls_bypass() AS ok`,
   );
   return { enforced: true, role: row.role, ...(system?.ok ? {} : { systemBlocked: true }) };
+}
+
+/** Fails closed when the connected login cannot bootstrap under the stored bypass key. */
+export async function assertRuntimeRowSecurity(prisma: PrismaClient): Promise<void> {
+  const status = await describeRowSecurity(prisma);
+  if (!status.enforced || status.systemBlocked) {
+    throw new Error("acceptance identity is not an enforced runtime login");
+  }
+  const [role] = await prisma.$queryRaw<
+    Array<{ superuser: boolean; bypass: boolean; member: boolean }>
+  >`SELECT r.rolsuper AS superuser, r.rolbypassrls AS bypass,
+      pg_has_role(current_user, ${RUNTIME_ROLE}, 'MEMBER') AS member
+    FROM pg_roles r WHERE r.rolname = current_user`;
+  if (!role || role.superuser || role.bypass || !role.member) {
+    throw new Error("acceptance identity is not an ordinary runtime member");
+  }
 }
 
 export function rowSecurityWarning(status: RowSecurityStatus): string | undefined {

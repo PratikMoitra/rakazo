@@ -48,6 +48,19 @@ it.skipIf(!existsSync("/usr/lib/postgresql/16/bin/initdb"))(
       expect(after.rolsuper).toBe(false);
       expect(after.rolbypassrls).toBe(false);
       expect(after.member).toBe(true);
+      const replacement = createDb(second.toString());
+      try {
+        const next = await identity(replacement.prisma);
+        expect(next.enforced).toBe(true);
+        expect(next.systemBlocked).toBe(false);
+        expect(next.bypass).toBe(true);
+        expect(next.rolsuper).toBe(false);
+        expect(next.rolbypassrls).toBe(false);
+        expect(next.member).toBe(true);
+      } finally {
+        await replacement.prisma.$disconnect();
+        await replacement.pool.end();
+      }
     } finally {
       await db?.prisma.$disconnect();
       await db?.pool.end();
@@ -95,7 +108,10 @@ function migrate(admin: URL, runtime: URL, worker: URL) {
         }),
       },
       (error, stdout, stderr) => {
-        if (error) reject(new Error(`${stderr}\n${stdout}`));
+        if (error)
+          reject(
+            new Error(`${stderr}\n${stdout}`.replace(/postgres(?:ql)?:\/\/\S+/g, "[database]")),
+          );
         else resolve();
       },
     );

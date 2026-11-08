@@ -4,7 +4,9 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  acceptanceChannels,
   asSystem,
+  assertRuntimeRowSecurity,
   describeRowSecurity,
   provisionRuntimeRole,
   runAsSystem,
@@ -13,19 +15,12 @@ import {
 import { expect, it } from "vitest";
 import { createApp } from "./app.js";
 
-const migrationUrl = process.env.DATABASE_MIGRATION_URL ?? process.env.DATABASE_URL;
-const enabled =
-  process.env.RAKAZO_DISPOSABLE_FIXTURE === "1" &&
-  process.env.VERIFY_DATABASE === "1" &&
-  Boolean(migrationUrl);
+const channels = acceptanceChannels();
 
-it.skipIf(!enabled)(
+it.skipIf(!channels)(
   "enforces cross-space artifact denial as a non-owner runtime role",
   async () => {
-    const runtimeUrl = new URL(migrationUrl!);
-    runtimeUrl.username = "rakazo_phase1_runtime";
-    runtimeUrl.password = "phase1-runtime-password";
-    await provisionRuntimeRole(migrationUrl!, runtimeUrl.toString());
+    await provisionRuntimeRole(channels!.migrationUrl, channels!.databaseUrl);
     process.env.BETTER_AUTH_SECRET ??= "phase1-auth-secret-phase1-auth-secret";
     process.env.ENCRYPTION_KEY ??= "phase1-encryption-key-phase1-encryption";
     process.env.SCREEN_PROXY_SECRET ??= "phase1-screen-proxy-secret-32chars";
@@ -33,7 +28,7 @@ it.skipIf(!enabled)(
     const dataDir = await mkdtemp(join(tmpdir(), "rakazo-phase1-rls-"));
     const origin = "http://127.0.0.1:5173";
     const handles = await createApp({
-      databaseUrl: runtimeUrl.toString(),
+      databaseUrl: channels!.databaseUrl,
       dataDir,
       sandboxProvider: "fake",
       agentRuntime: "scripted",
@@ -56,8 +51,10 @@ it.skipIf(!enabled)(
         .map((value) => value.split(";")[0])
         .join("; ") ?? "";
     try {
+      await assertRuntimeRowSecurity(handles.prisma);
       const status = await describeRowSecurity(handles.prisma);
       expect(status).toMatchObject({ enforced: true, role: "rakazo_phase1_runtime" });
+      expect(status.systemBlocked).toBeUndefined();
       const role = await handles.prisma.$queryRawUnsafe<
         Array<{ rolsuper: boolean; rolbypassrls: boolean }>
       >(`SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user`);
@@ -143,9 +140,9 @@ it.skipIf(!enabled)(
         handles.prisma.artifact.findMany({ where: { id: artifact.id }, select: { id: true } }),
       );
       expect(hidden).toEqual([]);
-      const database = new URL(migrationUrl!).pathname.slice(1);
+      const database = new URL(channels!.migrationUrl).pathname.slice(1);
       await psql(
-        migrationUrl!,
+        channels!.migrationUrl,
         `
         DO $$ BEGIN
           IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'rakazo_phase1_foreign') THEN
@@ -154,9 +151,15 @@ it.skipIf(!enabled)(
         END $$;
       `,
       );
-      await psql(migrationUrl!, `GRANT CONNECT ON DATABASE ${database} TO rakazo_phase1_foreign`);
-      await psql(migrationUrl!, `GRANT USAGE ON SCHEMA graphile_worker TO rakazo_phase1_foreign`);
-      const foreignUrl = new URL(migrationUrl!);
+      await psql(
+        channels!.migrationUrl,
+        `GRANT CONNECT ON DATABASE ${database} TO rakazo_phase1_foreign`,
+      );
+      await psql(
+        channels!.migrationUrl,
+        `GRANT USAGE ON SCHEMA graphile_worker TO rakazo_phase1_foreign`,
+      );
+      const foreignUrl = new URL(channels!.migrationUrl);
       foreignUrl.username = "rakazo_phase1_foreign";
       foreignUrl.password = "phase1-foreign-password";
       for (const statement of [
@@ -168,7 +171,7 @@ it.skipIf(!enabled)(
         await expect(psql(foreignUrl.toString(), statement)).rejects.toThrow(/permission denied/i);
       }
       const readable = await psql(
-        runtimeUrl.toString(),
+        channels!.databaseUrl,
         "SELECT count(*)::int AS count FROM graphile_worker._private_jobs",
       );
       expect(readable).toContain("count");

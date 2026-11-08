@@ -8,14 +8,12 @@ import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { serve } from "@hono/node-server";
-import { asSystem } from "@rakazo/db";
+import { acceptanceChannels, asSystem, assertRuntimeRowSecurity } from "@rakazo/db";
 import { expect, it } from "vitest";
 import { createApp } from "./app.js";
 
-const databaseUrl =
-  process.env.RAKAZO_DISPOSABLE_FIXTURE === "1" && process.env.VERIFY_DATABASE === "1"
-    ? process.env.DATABASE_URL
-    : undefined;
+const channels = acceptanceChannels();
+const databaseUrl = channels?.databaseUrl;
 const origin = "http://127.0.0.1:5173";
 
 it.skipIf(!databaseUrl)(
@@ -92,6 +90,7 @@ it.skipIf(!databaseUrl)(
     const port = (server.address() as AddressInfo).port;
     const system = asSystem(handles.prisma);
     try {
+      await assertRuntimeRowSecurity(handles.prisma);
       const signup = await fetch(`http://127.0.0.1:${port}/api/auth/sign-up/email`, {
         method: "POST",
         headers: { "content-type": "application/json", origin },
@@ -208,6 +207,7 @@ it.skipIf(!databaseUrl)(
     await new Promise<void>((resolve) => server.once("listening", () => resolve()));
     const port = (server.address() as AddressInfo).port;
     try {
+      await assertRuntimeRowSecurity(handles.prisma);
       const signup = await fetch(`http://127.0.0.1:${port}/api/auth/sign-up/email`, {
         method: "POST",
         headers: { "content-type": "application/json", origin },

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EmailEmulator, LocalArtifactStore } from "@rakazo/adapters";
 import { DEFAULT_UPLOAD_MAX_BYTES } from "@rakazo/contracts";
-import { asSystem, createDb } from "@rakazo/db";
+import { acceptanceChannels, asSystem, assertRuntimeRowSecurity, createDb } from "@rakazo/db";
 import { expect, it } from "vitest";
 import { requeueRunAfterShutdown } from "../../../packages/adapters/src/run-lifecycle.js";
 import { attachWorkspaceFileToThread } from "../../../packages/adapters/src/thread-artifacts.js";
@@ -13,10 +13,8 @@ import { createApp } from "./app.js";
 import { rpcRequestMaxBytes } from "./request-body-limit.js";
 import { setUploadPolicy } from "./upload-policy.js";
 
-const databaseUrl =
-  process.env.RAKAZO_DISPOSABLE_FIXTURE === "1" && process.env.VERIFY_DATABASE === "1"
-    ? process.env.DATABASE_URL
-    : undefined;
+const channels = acceptanceChannels();
+const databaseUrl = channels?.databaseUrl;
 const origin = "http://127.0.0.1:5173";
 const limit = DEFAULT_UPLOAD_MAX_BYTES;
 
@@ -46,6 +44,7 @@ it.skipIf(!databaseUrl)(
       maxUploadSizeBytes: limit,
       adminEmails: [adminEmail],
     });
+    await assertRuntimeRowSecurity(handles.prisma);
     const system = asSystem(handles.prisma);
     const call = (cookie: string, procedure: string, json: unknown = {}) =>
       handles.app.request(`/rpc/${procedure}`, {
@@ -428,7 +427,7 @@ it.skipIf(!databaseUrl)(
         where: { id: "default" },
         select: { maxUploadSizeBytes: true },
       });
-      const migrationUrl = process.env.DATABASE_MIGRATION_URL ?? databaseUrl;
+      const migrationUrl = channels!.migrationUrl;
       const ownerDb = createDb(migrationUrl!);
       const owner = asSystem(ownerDb.prisma);
       try {

@@ -5,6 +5,7 @@ import { execFileSync } from "node:child_process";
 import { migrateJobQueue, unwrapEnvFromKeyManager } from "@rakazo/adapters";
 import { loadRootEnv } from "@rakazo/core/node/load-root-env";
 import {
+  assertFixtureDatabaseEnv,
   credentialWorkerTarget,
   databaseUrls,
   deployMigrations,
@@ -19,6 +20,7 @@ import {
 
 loadRootEnv();
 await unwrapEnvFromKeyManager();
+assertFixtureDatabaseEnv(process.env);
 const urls = databaseUrls(process.env);
 const credentialWorker = credentialWorkerTarget(urls.url, process.env.DATABASE_WORKER_URL);
 if (credentialWorker.mode === "on") {

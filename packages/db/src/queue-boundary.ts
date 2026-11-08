@@ -1,17 +1,15 @@
 // Phase-1 addition for the isolated workspace slice. Apache-2.0; see LICENSE. Not an upstream Rakazo file.
-import { Client, escapeIdentifier, escapeLiteral } from "pg";
-import { parse as parseConnectionString } from "pg-connection-string";
+import { escapeIdentifier, escapeLiteral } from "pg";
 import { scramSha256Verifier } from "./database-access.js";
-
-/** Query keys that cannot change the host, port, database, login, password, socket, or TLS. */
-const BENIGN_PG_QUERY_KEYS = new Set(["application_name", "connect_timeout"]);
-
-const ENDPOINT_REFUSAL = "DATABASE_WORKER_URL is not the trusted migration endpoint";
-const TLS_REFUSAL = "DATABASE_WORKER_URL TLS mode is not explicitly supported";
-const OPTIONS_REFUSAL = "DATABASE_WORKER_URL startup options are not explicitly supported";
-const PLAINTEXT_REFUSAL =
-  "plaintext database transport requires an explicit disposable fixture on literal loopback";
-const LITERAL_LOOPBACK = new Set(["127.0.0.1", "::1"]);
+import type { ExplicitPgConfig } from "./fixture-transport.js";
+import {
+  ENDPOINT_REFUSAL,
+  explicitPgConfig,
+  explicitWorkerClientConfig,
+  fixtureConnectionPlan,
+  openExplicitClient,
+  openFixtureClient,
+} from "./fixture-transport.js";
 
 const QUEUE_OWNER = "rakazo_queue_owner";
 /** The only login `pnpm db:migrate` will create for credential cleanup. */
@@ -64,19 +62,6 @@ export interface CredentialWorkerConnection {
 }
 
 /**
- * Fields taken from the installed pg connection-string parser. Clients are
- * constructed from these fields and do not receive the original string.
- */
-export interface ExplicitPgConfig {
-  host: string;
-  port: number;
-  database: string;
-  user: string;
-  password?: string;
-  application_name?: string;
-}
-
-/**
  * Compares the effective host, port, and database. Query routing, authentication,
  * socket, and TLS overrides are rejected before any client exists. A different
  * host fails closed, including aliases that would require a network lookup.
@@ -103,102 +88,8 @@ export function pinnedEndpointConfigs(
   };
 }
 
-function explicitPgConfig(value: string): ExplicitPgConfig {
-  assertBenignPgQuery(value);
-  let parsed: ReturnType<typeof parseConnectionString>;
-  try {
-    parsed = parseConnectionString(value);
-  } catch {
-    throw new Error(ENDPOINT_REFUSAL);
-  }
-  if (parsed.ssl !== undefined || !parsed.host || parsed.host.startsWith("/")) {
-    throw new Error(ENDPOINT_REFUSAL);
-  }
-  const database = parsed.database ?? "";
-  const user = parsed.user ?? "";
-  const port = parsed.port ? Number(parsed.port) : 5432;
-  if (!database || !user || !Number.isInteger(port) || port < 1 || port > 65535) {
-    throw new Error(ENDPOINT_REFUSAL);
-  }
-  const applicationName = parsed.application_name ?? undefined;
-  if (applicationName !== undefined && !/^[A-Za-z0-9_.-]{1,64}$/.test(applicationName)) {
-    throw new Error(ENDPOINT_REFUSAL);
-  }
-  const host = parsed.host.toLowerCase();
-  assertLiteralLoopback(value, host);
-  return {
-    host,
-    port,
-    database,
-    user,
-    ...(typeof parsed.password === "string" && parsed.password.length > 0
-      ? { password: parsed.password }
-      : {}),
-    ...(applicationName ? { application_name: applicationName } : {}),
-  };
-}
-
-function assertLiteralLoopback(value: string, host: string): void {
-  if (process.env.RAKAZO_DISPOSABLE_FIXTURE !== "1" || !LITERAL_LOOPBACK.has(host)) {
-    throw new Error(PLAINTEXT_REFUSAL);
-  }
-  let url: URL;
-  try {
-    url = new URL(value);
-  } catch {
-    throw new Error(PLAINTEXT_REFUSAL);
-  }
-  const presented = url.hostname.toLowerCase();
-  if (presented.includes("%") || presented.includes(",") || presented.includes("@")) {
-    throw new Error(PLAINTEXT_REFUSAL);
-  }
-  const literal = presented.startsWith("[") ? presented.slice(1, -1) : presented;
-  if (literal !== host) throw new Error(PLAINTEXT_REFUSAL);
-}
-
-function assertBenignPgQuery(value: string): void {
-  let url: URL;
-  try {
-    url = new URL(value);
-  } catch {
-    throw new Error(ENDPOINT_REFUSAL);
-  }
-  if (url.protocol !== "postgres:" && url.protocol !== "postgresql:") {
-    throw new Error(ENDPOINT_REFUSAL);
-  }
-  const seen = new Set<string>();
-  for (const [rawKey] of url.searchParams.entries()) {
-    const key = rawKey.toLowerCase();
-    if (seen.has(key) || !BENIGN_PG_QUERY_KEYS.has(key)) throw new Error(ENDPOINT_REFUSAL);
-    seen.add(key);
-  }
-}
-
 function sameEndpoint(left: ExplicitPgConfig, right: ExplicitPgConfig): boolean {
   return left.host === right.host && left.port === right.port && left.database === right.database;
-}
-
-export function explicitWorkerClientConfig(config: ExplicitPgConfig) {
-  if (process.env.RAKAZO_DISPOSABLE_FIXTURE !== "1" || !LITERAL_LOOPBACK.has(config.host)) {
-    throw new Error(PLAINTEXT_REFUSAL);
-  }
-  if (!config.password) throw new Error(ENDPOINT_REFUSAL);
-  if (process.env.PGSSLMODE) throw new Error(TLS_REFUSAL);
-  if (process.env.PGOPTIONS) throw new Error(OPTIONS_REFUSAL);
-  return {
-    host: config.host,
-    port: config.port,
-    database: config.database,
-    user: config.user,
-    password: config.password,
-    application_name: config.application_name,
-    // Explicit false: pg otherwise reads PGSSLMODE, including no-verify.
-    ssl: false as const,
-  };
-}
-
-function openExplicitClient(config: ExplicitPgConfig): CredentialWorkerConnection {
-  return new Client(explicitWorkerClientConfig(config));
 }
 
 export async function preflightCredentialWorker(
@@ -337,13 +228,17 @@ function refusal(counts: {
 }
 
 /** Counts only. Does not delete or rewrite jobs. A nonzero count must refuse startup. */
-export async function preflightQueueBoundary(migrationUrl: string): Promise<{
+export async function preflightQueueBoundary(
+  migrationUrl: string,
+  open: (url: string) => CredentialWorkerConnection = openFixtureClient,
+): Promise<{
   tombstones: number;
   workItems: number;
   fixtures: number;
   opaqueJobs: number;
 }> {
-  const owner = new Client({ connectionString: migrationUrl });
+  fixtureConnectionPlan(migrationUrl);
+  const owner = open(migrationUrl);
   await owner.connect();
   try {
     const counts = await legacyQueueCounts(owner);
@@ -354,8 +249,12 @@ export async function preflightQueueBoundary(migrationUrl: string): Promise<{
   }
 }
 
-export async function installQueueBoundary(migrationUrl: string): Promise<void> {
-  const owner = new Client({ connectionString: migrationUrl });
+export async function installQueueBoundary(
+  migrationUrl: string,
+  open: (url: string) => CredentialWorkerConnection = openFixtureClient,
+): Promise<void> {
+  fixtureConnectionPlan(migrationUrl);
+  const owner = open(migrationUrl);
   await owner.connect();
   try {
     const ready = await owner.query<{ ready: boolean }>(
@@ -375,14 +274,16 @@ export async function installQueueBoundary(migrationUrl: string): Promise<void> 
 export async function provisionCredentialWorker(
   migrationUrl: string,
   workerUrl: string,
+  open: (url: string) => CredentialWorkerConnection = openFixtureClient,
 ): Promise<void> {
-  const parsed = new URL(workerUrl);
-  const login = decodeURIComponent(parsed.username);
-  const password = decodeURIComponent(parsed.password);
+  const worker = fixtureConnectionPlan(workerUrl);
+  fixtureConnectionPlan(migrationUrl);
+  const login = worker.user;
+  const password = worker.password;
   if (login !== MANAGED_CREDENTIAL_WORKER) {
     throw new Error("DATABASE_WORKER_URL must use the managed credential worker login");
   }
-  const owner = new Client({ connectionString: migrationUrl });
+  const owner = open(migrationUrl);
   await owner.connect();
   try {
     await preflightCredentialWorker(migrationUrl, workerUrl);
@@ -450,7 +351,7 @@ export async function attestCredentialWorker(
   migrationUrl: string,
   workerUrl: string,
   open: (config: ExplicitPgConfig) => CredentialWorkerConnection = (config) =>
-    new Client({ ...explicitWorkerClientConfig(config), connectionTimeoutMillis: 3000 }),
+    openExplicitClient(config, 3000),
 ): Promise<void> {
   const endpoints = pinnedEndpointConfigs(migrationUrl, workerUrl);
   if (
@@ -513,7 +414,7 @@ export async function countLegacyCredentialJobs(query: {
   return found.rows[0]?.n ?? 0;
 }
 
-async function grantDefinerQueueAccess(owner: Client): Promise<void> {
+async function grantDefinerQueueAccess(owner: CredentialWorkerConnection): Promise<void> {
   await owner.query(`
     GRANT USAGE ON SCHEMA graphile_worker, public, queue_private, queue_api TO ${QUEUE_OWNER};
     GRANT SELECT, UPDATE ON TABLE messaging_installations TO ${QUEUE_OWNER};
@@ -546,7 +447,11 @@ async function grantDefinerQueueAccess(owner: Client): Promise<void> {
   }
 }
 
-async function grantQueuePolicy(owner: Client, policy: string, role: string): Promise<void> {
+async function grantQueuePolicy(
+  owner: CredentialWorkerConnection,
+  policy: string,
+  role: string,
+): Promise<void> {
   const tables = await owner.query<{ name: string }>(
     `SELECT c.relname AS name FROM pg_class c
      WHERE c.relnamespace = 'graphile_worker'::regnamespace AND c.relrowsecurity`,
@@ -565,7 +470,7 @@ function loginOf(url: string): string {
   return decodeURIComponent(new URL(url).username);
 }
 
-async function legacyQueueCounts(owner: Client): Promise<{
+async function legacyQueueCounts(owner: CredentialWorkerConnection): Promise<{
   tombstones: number;
   workItems: number;
   fixtures: number;

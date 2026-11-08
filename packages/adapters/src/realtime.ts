@@ -1,6 +1,6 @@
 import type { RealtimeFanout } from "@rakazo/adapter-kit";
+import { fixtureConnectionPlan, openFixtureClient } from "@rakazo/db";
 import type { Notification } from "pg";
-import { Client } from "pg";
 
 const POSTGRES_CHANNEL = "rakazo_events";
 const MAX_NOTIFY_PAYLOAD_BYTES = 7_900;
@@ -41,12 +41,13 @@ export class PostgresRealtimeFanout implements RealtimeFanout {
   private closed = false;
 
   constructor(private readonly options: PostgresRealtimeOptions) {
+    // Validate before a deferred or injected factory can open a client.
+    fixtureConnectionPlan(options.connectionString);
     this.clientFactory =
       options.clientFactory ??
       (() =>
-        new Client({
-          connectionString: options.connectionString,
-          application_name: "rakazo-realtime",
+        openFixtureClient(options.connectionString, {
+          applicationName: "rakazo-realtime",
           connectionTimeoutMillis: 5_000,
         }) as RealtimeListenerClient);
     this.reconnectBaseMs = options.reconnectBaseMs ?? 250;

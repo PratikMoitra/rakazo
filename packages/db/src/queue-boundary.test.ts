@@ -1,13 +1,13 @@
 import { Client } from "pg";
 import { describe, expect, it } from "vitest";
-import type { ExplicitPgConfig } from "./queue-boundary.js";
+import type { ExplicitPgConfig } from "./fixture-transport.js";
+import { explicitWorkerClientConfig } from "./fixture-transport.js";
 import {
   assertPinnedWorkerEndpoint,
   attestCredentialWorker,
   CREDENTIAL_DELETE_TIMEOUT_MS,
   CREDENTIAL_RETIREMENT_LEASE_SECONDS,
   credentialWorkerTarget,
-  explicitWorkerClientConfig,
   migrationAuthProbe,
   pinnedEndpointConfigs,
   preflightCredentialWorker,

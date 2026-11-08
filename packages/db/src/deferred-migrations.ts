@@ -2,7 +2,13 @@ import { execFileSync } from "node:child_process";
 import { cpSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { Client } from "pg";
+import type { Client } from "pg";
+import {
+  fixtureConnectionPlan,
+  fixtureEngineEnv,
+  fixtureEngineUrl,
+  openFixtureClient,
+} from "./fixture-transport.js";
 
 /** First line of a migration that may only run once the release before it has stopped. */
 export const DEFERRED_MIGRATION_MARKER = "-- deferred";
@@ -42,7 +48,8 @@ export async function heldBackMigrations(
     )
     .map((entry) => entry.name);
   if (deferred.length === 0) return [];
-  const client = new Client({ connectionString: migrationUrl });
+  fixtureConnectionPlan(migrationUrl);
+  const client = openFixtureClient(migrationUrl);
   await client.connect();
   try {
     const done = await appliedMigrations(client);
@@ -68,7 +75,8 @@ export async function heldBackMigrations(
 }
 
 async function forgetHeldBack(migrationUrl: string, names: string[]) {
-  const client = new Client({ connectionString: migrationUrl });
+  fixtureConnectionPlan(migrationUrl);
+  const client = openFixtureClient(migrationUrl);
   await client.connect();
   try {
     await client.query('DELETE FROM "_deferred_migrations" WHERE name = ANY($1)', [names]);
@@ -86,7 +94,8 @@ const LOCK_TIMEOUT_MS = 5_000;
  * open transaction to finish, which a lock timeout would cancel.
  */
 async function buildsIndexConcurrently(migrationUrl: string, migrationsPath: string) {
-  const client = new Client({ connectionString: migrationUrl });
+  fixtureConnectionPlan(migrationUrl);
+  const client = openFixtureClient(migrationUrl);
   await client.connect();
   try {
     const done = (await appliedMigrations(client)) ?? new Set<string>();
@@ -106,14 +115,6 @@ async function buildsIndexConcurrently(migrationUrl: string, migrationsPath: str
   }
 }
 
-/** A migration waiting on a lock queues every later query on that table behind it. */
-function withLockTimeout(url: string, ms: number) {
-  const parsed = new URL(url);
-  const options = [parsed.searchParams.get("options"), `-c lock_timeout=${ms}`];
-  parsed.searchParams.set("options", options.filter(Boolean).join(" "));
-  return parsed.toString();
-}
-
 const LOCK_CONFLICT = /\b(40P01|55P03)\b/;
 const NOT_ONE_TRANSACTION = /\b(CONCURRENTLY|COMMIT)\b/i;
 const LOCK_RETRY_DELAYS_MS = [2_000, 10_000];
@@ -123,7 +124,8 @@ const LOCK_RETRY_DELAYS_MS = [2_000, 10_000];
  * timeout) and ran as one transaction, so nothing of it stayed applied and running it again is safe.
  */
 async function rollBackLockConflict(migrationUrl: string, migrationsPath: string) {
-  const client = new Client({ connectionString: migrationUrl });
+  fixtureConnectionPlan(migrationUrl);
+  const client = openFixtureClient(migrationUrl);
   await client.connect();
   try {
     const { rows } = await client.query<{
@@ -163,6 +165,7 @@ export async function deployMigrations(input: {
   lockTimeoutMs?: number;
   previousMigrations?: readonly string[];
 }) {
+  fixtureConnectionPlan(input.migrationUrl);
   const migrationsDir = input.migrationsDir ?? path.join(input.dbPackageDir, "prisma/migrations");
   const held = await heldBackMigrations(
     input.migrationUrl,
@@ -179,19 +182,16 @@ export async function deployMigrations(input: {
     process.stdout.write(`Holding back until the next migration run: ${held.join(", ")}\n`);
   }
   try {
-    const deployUrl = (await buildsIndexConcurrently(input.migrationUrl, migrationsPath))
-      ? input.migrationUrl
-      : withLockTimeout(input.migrationUrl, input.lockTimeoutMs ?? LOCK_TIMEOUT_MS);
+    const concurrent = await buildsIndexConcurrently(input.migrationUrl, migrationsPath);
+    const deployUrl = concurrent
+      ? fixtureEngineUrl(input.migrationUrl)
+      : fixtureEngineUrl(input.migrationUrl, input.lockTimeoutMs ?? LOCK_TIMEOUT_MS);
     for (let attempt = 0; ; attempt++) {
       try {
         execFileSync("pnpm", ["exec", "prisma", "migrate", "deploy"], {
           cwd: input.dbPackageDir,
           stdio: "inherit",
-          env: {
-            ...process.env,
-            DATABASE_MIGRATION_URL: deployUrl,
-            RAKAZO_MIGRATIONS_PATH: migrationsPath,
-          },
+          env: fixtureEngineEnv(deployUrl, { RAKAZO_MIGRATIONS_PATH: migrationsPath }),
         });
         break;
       } catch (error) {

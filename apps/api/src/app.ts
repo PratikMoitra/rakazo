@@ -128,6 +128,7 @@ import {
 import { encryptionKeyWarning, signupPolicyFromEnv } from "@rakazo/core";
 import type { Pool, PrismaClient } from "@rakazo/db";
 import {
+  assertFixtureDatabaseEnv,
   configureProviderTransactionPool,
   createBoardEvents,
   createDb,
@@ -318,6 +319,13 @@ async function buildApp(overrides: CreateAppOverrides): Promise<AppHandles> {
   installLogger(logger);
   const poolMax = parsePositiveInteger(process.env.DB_POOL_MAX, 4);
   configureProviderTransactionPool(poolMax);
+  if (!prismaOverride) {
+    assertFixtureDatabaseEnv({
+      ...process.env,
+      DATABASE_URL: env.databaseUrl,
+      REALTIME_DATABASE_URL: env.realtimeDatabaseUrl,
+    });
+  }
   const created = prismaOverride
     ? { prisma: prismaOverride, pool: undefined }
     : createDb(env.databaseUrl, {
