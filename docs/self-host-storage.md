@@ -202,13 +202,38 @@ Restart API and worker processes after both commands finish. A schema-only rollb
 compatible with the previous release, but the old code does not read database registrations
 or object-backed artifacts.
 
+<!-- Modified in the isolated phase-1 workspace slice. Apache-2.0; see LICENSE. Not an upstream Rakazo release. -->
+
 ## Upload size
 
 `MAX_UPLOAD_SIZE_MB` sets the per-file chat attachment and computer file transfer limit
-in MiB (1 MiB = 1,048,576 bytes). It defaults to `10` and must be a positive integer.
-Set it in `.env` and restart the API, worker, and Docker supervisor (when used). Web, desktop, and mobile use the
-limit advertised by the server. If a reverse proxy limits request bodies, allow
+in MiB (1 MiB = 1,048,576 bytes). When it is unset, the limit is 25 MiB, exactly
+26,214,400 bytes. The historical baseline at `1f0dc6de46f2fa7a5b6d1bbbc434f518bdd1239d`
+was 10 MiB (10,485,760 bytes). It must be a positive integer. Set `10` to keep that
+older limit. Clients that have not received a server advertisement still fall back to
+10 MiB. There is no separate chat message-total byte cap in this tree; the per-message
+count is independent and stays at 4 (ceiling 100). No virus scanner runs, and there
+is no quarantine directory. Accepted files are stored under a generated id with
+owner-only permissions after the byte check. SVG is not an allowed attachment type.
+HTML previews may run script inside a sandbox that does not share the app origin and
+blocks outbound loads; that is not a malware scan.
+Set it in `.env` and restart the API, worker, and Docker supervisor (when used). The variable
+is a count of mebibytes, from 1 through 25. The byte ceiling is 26,214,400. A setting of
+26214400 is rejected, because that would be 26214400 MiB rather than 26,214,400 bytes.
+An explicit value is the effective limit and the HTTP allocation ceiling. While it is set, an
+a verified deployment admin cannot store a different limit, and a stored value cannot raise it.
+When it is unset, only a verified deployment admin may store 1,048,576 through 26,214,400 bytes
+in steps of 1 MiB. An organization owner or admin role is not enough.
+Zero, negative, fractional, and larger values are rejected. Web, desktop, and mobile read
+`me.maxUploadSizeBytes`, which is that one effective byte count. `me.uploadPolicy` repeats it
+with `source` of `env`, `persisted`, or `default`. If a reverse proxy limits request bodies, allow
 room for base64 encoding (about 4/3 of the file size) and the JSON envelope.
+
+Chat attachment upload, inbound mail attachments, account import, and files a run saves from
+its computer all use the effective byte limit, including a stored limit that is lower than the
+process ceiling. The Docker supervisor file HTTP route enforces the process ceiling, at most
+26,214,400 bytes, and does not read the stored limit: it has no database. The host computer
+channel does not carry a 25 MiB file: its message cap stays 12 MiB and its file cap stays 8 MiB.
 
 `MAX_ATTACHMENTS_PER_MESSAGE` sets the chat attachment count per message. It defaults
 to `4` and accepts integers from `1` to `100`. Set it in `.env` and restart the API.

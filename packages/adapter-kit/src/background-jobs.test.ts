@@ -49,11 +49,14 @@ describe("background job contracts", () => {
 
   it("validates and dispatches retired messaging credential cleanup", async () => {
     const target = handlers();
-    const payload = { installationId: "install-a", ref: "encrypted-reference" };
+    const payload = { workItemId: "5b0b5a6e-3e2a-4f5b-9c1d-6a7b8c9d0e1f" };
     await dispatchBackgroundJob(target, "messaging.credential-cleanup", payload);
     expect(target["messaging.credential-cleanup"]).toHaveBeenCalledWith(payload);
     expect(() =>
-      parseBackgroundJob("messaging.credential-cleanup", { ref: "encrypted-reference" }),
+      parseBackgroundJob("messaging.credential-cleanup", {
+        installationId: "install-a",
+        ref: "encrypted-reference",
+      }),
     ).toThrow();
   });
 

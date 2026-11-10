@@ -1,5 +1,18 @@
-/** Default for deployments and clients connected to older servers. */
+// Modified in the isolated phase-1 workspace slice (Apache-2.0; see LICENSE). Not an upstream Rakazo release.
+/**
+ * Fallback when a server does not advertise a limit. Historical deployments and
+ * clients that never received `maxUploadSizeBytes` use 10 MiB. An unset
+ * `MAX_UPLOAD_SIZE_MB` on this slice uses {@link DEFAULT_UPLOAD_MAX_BYTES}.
+ */
 export const ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024;
+/** Deployment default: 25 MiB, exactly 26,214,400 bytes. */
+export const DEFAULT_UPLOAD_MAX_BYTES = 26_214_400;
+/** Stable machine code when actual bytes exceed the configured per-file limit. */
+export const UPLOAD_TOO_LARGE_CODE = "upload_too_large";
+export const UPLOAD_POLICY_FORBIDDEN_CODE = "upload_policy_forbidden";
+export const UPLOAD_POLICY_LOCKED_CODE = "upload_policy_locked";
+export const UPLOAD_POLICY_INVALID_CODE = "upload_policy_invalid";
+export const UPLOAD_INCOMPLETE_CODE = "upload_incomplete";
 export const ATTACHMENT_MAX_COUNT = 4;
 /** Hard ceiling for the configurable per-message limit. */
 export const ATTACHMENT_COUNT_CEILING = 100;

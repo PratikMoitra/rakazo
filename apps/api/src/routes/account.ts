@@ -1,3 +1,4 @@
+// Modified in the isolated phase-1 workspace slice (Apache-2.0; see LICENSE). Not an upstream Rakazo release.
 import { ORPCError } from "@orpc/server";
 import {
   changeUserTimezone,
@@ -44,6 +45,7 @@ import type { BillingService } from "../billing.js";
 import { firstModelConnectAnalytics } from "../model-connect-analytics.js";
 import type { RouterDeps } from "../router.js";
 import { withSerializableRetry } from "../serializable-retry.js";
+import { currentUploadPolicy, setUploadPolicy } from "../upload-policy.js";
 import {
   disconnectVoiceCredential,
   listVoiceCatalog,
@@ -232,6 +234,19 @@ export function accountRoutes(ctx: RouterContext) {
           return meDto(deps, context.actor);
         },
       ),
+    },
+    uploadPolicy: {
+      get: authed.uploadPolicy.get.handler(async () =>
+        currentUploadPolicy({ prisma: deps.prisma, env: deps.env }),
+      ),
+      set: authed.uploadPolicy.set.handler(async ({ context, input }) => {
+        await requireAdmin(deps, context.actor.userId);
+        return setUploadPolicy(
+          { prisma: deps.prisma, env: deps.env },
+          context.actor,
+          input.maxFileBytes,
+        );
+      }),
     },
     // Retain wire compatibility for older clients, but app accounts have no server authority.
     deployment: {

@@ -19,7 +19,19 @@ export class MessagingInstallations implements MessagingInstallationStore {
     private readonly prisma: PrismaClient,
     private readonly secrets: SecretStore,
     readonly provider: MessagingInstallProvider,
-    private readonly cleanupJobs?: Pick<JobPublisher, "enqueue">,
+    _cleanupJobs?: Pick<JobPublisher, "enqueue">,
+    private readonly credentials?: {
+      register: (
+        tx: Pick<PrismaClient, "$queryRaw">,
+        installationId: string,
+        objectKey: string,
+      ) => Promise<void>;
+      recordOrphan: (objectKey: string, installationId: string, recordId: string) => Promise<void>;
+      retirement?: {
+        capture: (tx: Pick<PrismaClient, "$queryRaw">, installationId: string) => Promise<string>;
+        enqueue: (tx: Pick<PrismaClient, "$queryRaw">, workItemId: string) => Promise<void>;
+      };
+    },
   ) {}
 
   /** Without a chosen bot, the workspace answers as the user's first bot in the current space. */
@@ -110,6 +122,9 @@ export class MessagingInstallations implements MessagingInstallationStore {
         ? installationSenderAddress(external.workspaceId, external.ownerId)
         : null;
       const previousCiphertext = existing?.ciphertext;
+      if (existing && !this.credentials?.retirement) {
+        throw new Error("credential cleanup worker is not configured");
+      }
       const sealed = await this.secrets.put(
         external.credential,
         {
@@ -122,39 +137,48 @@ export class MessagingInstallations implements MessagingInstallationStore {
         { recordId: id },
       );
       try {
-        if (existing) {
-          // Compare owner and previous ciphertext: disconnect/reinstall must not be undone.
-          const updated = await this.prisma.messagingInstallation.updateMany({
-            where: {
-              id,
-              spaceId: session.spaceId,
-              userId: session.userId,
-              botId: session.botId,
-              ciphertext: previousCiphertext,
-            },
-            data: {
-              ciphertext: sealed.ciphertext,
-              workspaceName: external.workspaceName,
-              ownerAddress,
-            },
-          });
-          if (updated.count !== 1) throw new Error("Workspace connection changed; try again");
-        } else {
-          // The unique workspace key prevents concurrent installs claiming two tenants.
-          await this.prisma.messagingInstallation.create({
-            data: {
-              id,
-              provider: session.provider,
-              workspaceId: external.workspaceId,
-              workspaceName: external.workspaceName,
-              spaceId: session.spaceId,
-              userId: session.userId,
-              botId: session.botId,
-              ciphertext: sealed.ciphertext,
-              ownerAddress,
-            },
-          });
-        }
+        await this.prisma.$transaction(async (tx) => {
+          if (!this.credentials) throw new Error("credential object registry is not configured");
+          await this.credentials.register(tx, id, sealed.ciphertext);
+          const retiring =
+            previousCiphertext && previousCiphertext !== sealed.ciphertext
+              ? await this.credentials.retirement!.capture(tx, id)
+              : undefined;
+          if (existing) {
+            // Compare owner and previous ciphertext: disconnect/reinstall must not be undone.
+            const updated = await tx.messagingInstallation.updateMany({
+              where: {
+                id,
+                spaceId: session.spaceId,
+                userId: session.userId,
+                botId: session.botId,
+                ciphertext: previousCiphertext,
+              },
+              data: {
+                ciphertext: sealed.ciphertext,
+                workspaceName: external.workspaceName,
+                ownerAddress,
+              },
+            });
+            if (updated.count !== 1) throw new Error("Workspace connection changed; try again");
+          } else {
+            // The unique workspace key prevents concurrent installs claiming two tenants.
+            await tx.messagingInstallation.create({
+              data: {
+                id,
+                provider: session.provider,
+                workspaceId: external.workspaceId,
+                workspaceName: external.workspaceName,
+                spaceId: session.spaceId,
+                userId: session.userId,
+                botId: session.botId,
+                ciphertext: sealed.ciphertext,
+                ownerAddress,
+              },
+            });
+          }
+          if (retiring) await this.credentials?.retirement?.enqueue(tx, retiring);
+        });
       } catch (error) {
         // A transport error may happen after a committed write; never remove a referenced secret.
         try {
@@ -162,15 +186,14 @@ export class MessagingInstallations implements MessagingInstallationStore {
             where: { id },
             select: { ciphertext: true },
           });
-          if (current?.ciphertext !== sealed.ciphertext)
-            await this.cleanupCredential(sealed.ciphertext, id);
+          if (current?.ciphertext !== sealed.ciphertext) {
+            await this.recordOrphan(sealed.ciphertext, id);
+          }
         } catch {
           getLogger().warn("unused messaging credential cleanup failed");
         }
         throw error;
       }
-      if (previousCiphertext && previousCiphertext !== sealed.ciphertext)
-        await this.cleanupCredential(previousCiphertext, id);
     });
   }
 
@@ -249,7 +272,11 @@ export class MessagingInstallations implements MessagingInstallationStore {
     userId: string;
     ciphertext: string;
   }) {
+    if (!this.credentials?.retirement) {
+      throw new Error("credential cleanup worker is not configured");
+    }
     const removed = await this.prisma.$transaction(async (tx) => {
+      const retiring = await this.credentials!.retirement!.capture(tx, installation.id);
       await tx.messagingIdentity.deleteMany({
         where: {
           spaceId: installation.spaceId,
@@ -266,9 +293,10 @@ export class MessagingInstallations implements MessagingInstallationStore {
         },
       });
       if (result.count !== 1) throw new Error("Workspace connection changed; try again");
+      await this.credentials?.retirement?.enqueue(tx, retiring);
       return true;
     });
-    if (removed) await this.cleanupCredential(installation.ciphertext, installation.id);
+    if (!removed) return;
   }
 
   async isActive(id: string): Promise<boolean> {
@@ -304,21 +332,12 @@ export class MessagingInstallations implements MessagingInstallationStore {
       return { ...installation, credential: await this.secrets.load(ciphertext, row.id) };
     });
   }
-  private async cleanupCredential(ref: string, installationId: string): Promise<void> {
+  private async recordOrphan(objectKey: string, installationId: string): Promise<void> {
+    if (!this.credentials) throw new Error("credential_orphan_unrecorded");
     try {
-      await this.secrets.delete(ref, installationId);
+      await this.credentials.recordOrphan(objectKey, installationId, installationId);
     } catch {
-      getLogger().warn("messaging credential cleanup failed; queuing retry");
-      try {
-        await this.cleanupJobs?.enqueue({
-          name: "messaging.credential-cleanup",
-          payload: { installationId, ref },
-          replaceKey: `messaging.credential-cleanup:${credentialDigest(ref)}`,
-          maxAttempts: 20,
-        });
-      } catch {
-        getLogger().warn("messaging credential cleanup retry could not be queued");
-      }
+      throw new Error("credential_orphan_unrecorded");
     }
   }
 

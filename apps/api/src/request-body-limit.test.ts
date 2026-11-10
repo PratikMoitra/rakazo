@@ -1,4 +1,5 @@
-import { ATTACHMENT_MAX_BASE64_LENGTH } from "@rakazo/contracts";
+// Modified in the isolated phase-1 workspace slice (Apache-2.0; see LICENSE). Not an upstream Rakazo release.
+import { ATTACHMENT_MAX_BASE64_LENGTH, DEFAULT_UPLOAD_MAX_BYTES } from "@rakazo/contracts";
 import { Hono } from "hono";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -40,7 +41,53 @@ describe("API request body limits", () => {
     expect(rejected.status).toBe(413);
     expect(await rejected.json()).toEqual({
       error: "Request body is too large. Upload limit: 25 MiB per file.",
+      code: "upload_too_large",
     });
+  });
+
+  it("rejects an unfinished body before the route parser", async () => {
+    const { app, parse } = testApp(1024);
+    const response = await app.request(
+      new Request("http://localhost/parse", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: new ReadableStream({
+          pull(controller) {
+            controller.error(new Error("client cancelled"));
+          },
+        }),
+        duplex: "half",
+      } as RequestInit & { duplex: "half" }),
+    );
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({
+      error: "Upload was not finished.",
+      code: "upload_incomplete",
+    });
+    expect(parse).not.toHaveBeenCalled();
+  });
+
+  it("counts actual bytes when Content-Length understates the body", async () => {
+    const cancel = vi.fn();
+    const { app, parse } = testApp(8);
+    const response = await app.request(
+      new Request("http://localhost/parse", {
+        method: "POST",
+        headers: { "content-type": "application/json", "content-length": "2" },
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('{"value":"too large"}'));
+          },
+          cancel,
+        }),
+        duplex: "half",
+      } as RequestInit & { duplex: "half" }),
+    );
+
+    expect(response.status).toBe(413);
+    await expect(response.json()).resolves.toEqual({ error: "Request body is too large." });
+    expect(parse).not.toHaveBeenCalled();
+    expect(cancel).toHaveBeenCalled();
   });
 
   it("discards a signed-out RPC body unread", async () => {
@@ -72,6 +119,7 @@ describe("API request body limits", () => {
 
   it("keeps the RPC allowance above the largest supported attachment envelope", () => {
     expect(MAX_RPC_REQUEST_BYTES).toBeGreaterThan(ATTACHMENT_MAX_BASE64_LENGTH);
+    expect(rpcRequestMaxBytes()).toBeGreaterThan(Math.ceil(DEFAULT_UPLOAD_MAX_BYTES / 3) * 4);
     expect(MAX_AUTH_REQUEST_BYTES).toBeLessThan(MAX_RPC_REQUEST_BYTES);
   });
 

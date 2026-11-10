@@ -48,3 +48,16 @@ verify-report
 .playwright-cli
 .deploy.lock
 .last-deployed-revision
+
+# Phase-1 fixture entrypoints and tests are not part of a deployment image.
+# The production flag rejection stays in the worker source and is not listed below.
+apps/worker/src/phase1-fixture-secret-store.ts
+apps/worker/src/phase1-cleanup-fixture-main.ts
+apps/worker/src/phase1-fixture-boundary.test.ts
+apps/api/src/phase1-fixture-cluster.ts
+apps/api/src/phase1-fixture-env.ts
+apps/api/src/phase1-fixture-env.test.ts
+apps/api/src/phase1-queue.postgres.test.ts
+apps/api/src/phase1-cleanup-once.ts
+**/*.test.ts
+**/*.postgres.test.ts

@@ -1,3 +1,4 @@
+// Modified in the isolated phase-1 workspace slice (Apache-2.0; see LICENSE). Not an upstream Rakazo release.
 import type {
   AgentContextStrategy,
   AgentHomeStore,
@@ -29,6 +30,8 @@ export interface ExecutorDeps {
   /** The present moment the agent is told; evals move it to a follow-up's due time. */
   now?: () => Date;
   maxUploadSizeBytes?: number;
+  /** True when MAX_UPLOAD_SIZE_MB is set. A stored limit cannot replace that ceiling. */
+  uploadSizeExplicit?: boolean;
   contextStrategy?: AgentContextStrategy;
   prisma: PrismaClient;
   events: ThreadEvents;

@@ -10,6 +10,9 @@ import { createLogger, createTestSink, installLogger, wrapJobPayload } from "@ra
 import type { Runner } from "graphile-worker";
 import { makeWorkerUtils } from "graphile-worker";
 import type { Pool } from "pg";
+
+const allowUnownedDouble = () => undefined;
+
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const run = vi.hoisted(() => vi.fn());
@@ -113,7 +116,7 @@ describe("GraphileJobPublisher.enqueue", () => {
     vi.mocked(makeWorkerUtils).mockResolvedValue({ addJob, release: vi.fn() } as never);
     const findUnique = vi.fn(async () => ({ trigger }));
     const prisma = { run: { findUnique } } as unknown as Pick<PrismaClient, "run">;
-    const publisher = new GraphileJobPublisher({} as Pool, prisma);
+    const publisher = new GraphileJobPublisher({} as Pool, prisma, allowUnownedDouble);
     try {
       await publisher.enqueue({ name: "run.continue", payload: { runId: "fixture-run" } });
       expect(findUnique).toHaveBeenCalledWith({
@@ -130,7 +133,7 @@ describe("GraphileJobPublisher.enqueue", () => {
       addJob,
       release: vi.fn(async () => undefined),
     } as never);
-    return new GraphileJobPublisher({} as Pool);
+    return new GraphileJobPublisher({} as Pool, undefined, allowUnownedDouble);
   }
 
   it("forwards the job's maxAttempts cap to graphile", async () => {
@@ -205,7 +208,10 @@ describe("GraphileJobPublisher.enqueue", () => {
       withPgClient: graphile.withPgClient,
       release: vi.fn(async () => undefined),
     } as never);
-    return { publisher: new GraphileJobPublisher({} as Pool), ...graphile };
+    return {
+      publisher: new GraphileJobPublisher({} as Pool, undefined, allowUnownedDouble),
+      ...graphile,
+    };
   }
 
   it("keeps attempts and run_at while a keyed job still has attempts left", async () => {
@@ -318,7 +324,10 @@ describe("reserved Graphile workloads", () => {
   it("reserves disjoint task lists and stops every runner", async () => {
     const runners = [mockRunner(), mockRunner(), mockRunner()];
     for (const { runner } of runners) run.mockResolvedValueOnce(runner);
-    const host = createReservedGraphileJobWorkerHost({} as Pool, { concurrency: 4 });
+    const host = createReservedGraphileJobWorkerHost({} as Pool, {
+      concurrency: 4,
+      poolCheck: allowUnownedDouble,
+    });
     await host.start(handlers());
     const configurations = run.mock.calls.map(([options]) => options);
     expect(configurations.map(({ concurrency }) => concurrency)).toEqual([4, 1, 100]);
@@ -347,7 +356,7 @@ describe("reserved Graphile workloads", () => {
   it("stops runners already started if another workload cannot start", async () => {
     const first = mockRunner();
     run.mockResolvedValueOnce(first.runner).mockRejectedValueOnce(tooMany);
-    const host = createReservedGraphileJobWorkerHost({} as Pool);
+    const host = createReservedGraphileJobWorkerHost({} as Pool, { poolCheck: allowUnownedDouble });
     await expect(host.start(handlers())).rejects.toBe(tooMany);
     expect(first.runner.stop).toHaveBeenCalled();
   });
@@ -360,7 +369,7 @@ describe("reserved Graphile workloads", () => {
         release = resolve;
       }),
     );
-    const host = createReservedGraphileJobWorkerHost({} as Pool);
+    const host = createReservedGraphileJobWorkerHost({} as Pool, { poolCheck: allowUnownedDouble });
     const starting = host.start(handlers());
     await vi.waitFor(() => expect(run).toHaveBeenCalledOnce());
     await host.stop();
@@ -372,7 +381,7 @@ describe("reserved Graphile workloads", () => {
 
   it("dispatches legacy chat jobs after stopping and restarting", async () => {
     for (let i = 0; i < 6; i++) run.mockResolvedValueOnce(mockRunner().runner);
-    const host = createReservedGraphileJobWorkerHost({} as Pool);
+    const host = createReservedGraphileJobWorkerHost({} as Pool, { poolCheck: allowUnownedDouble });
     const target = handlers();
     try {
       for (let cycle = 0; cycle < 2; cycle++) {
@@ -412,7 +421,11 @@ describe("GraphileJobWorkerHost runner lifecycle", () => {
 
   it("stops waiting for a handed-off run that outlives the drain deadline", async () => {
     run.mockResolvedValueOnce(mockRunner().runner);
-    const host = new GraphileJobWorkerHost({} as Pool, { concurrency: 1, drainTimeoutMs: 20 });
+    const host = new GraphileJobWorkerHost({} as Pool, {
+      poolCheck: allowUnownedDouble,
+      concurrency: 1,
+      drainTimeoutMs: 20,
+    });
     const hung = deferred();
     const target = handlers();
     target["run.continue"] = async (_payload, execution) => {
@@ -430,7 +443,10 @@ describe("GraphileJobWorkerHost runner lifecycle", () => {
 
   it("releases dispatch slots after durable handoff and drains executions at shutdown", async () => {
     run.mockResolvedValueOnce(mockRunner().runner);
-    const host = new GraphileJobWorkerHost({} as Pool, { concurrency: 4 });
+    const host = new GraphileJobWorkerHost({} as Pool, {
+      poolCheck: allowUnownedDouble,
+      concurrency: 4,
+    });
     const release = deferred();
     const target = handlers();
     let started = 0;
@@ -463,7 +479,10 @@ describe("GraphileJobWorkerHost runner lifecycle", () => {
 
   it("waits for memory headroom without imposing a resident run count", async () => {
     run.mockResolvedValueOnce(mockRunner().runner);
-    const host = new GraphileJobWorkerHost({} as Pool, { concurrency: 1 });
+    const host = new GraphileJobWorkerHost({} as Pool, {
+      poolCheck: allowUnownedDouble,
+      concurrency: 1,
+    });
     const releases = [deferred(), deferred(), deferred()];
     const entered: string[] = [];
     const target = handlers();
@@ -668,7 +687,7 @@ describe("GraphileJobWorkerHost runner lifecycle", () => {
 
   it("rejects setup failures through the original queue delivery", async () => {
     run.mockResolvedValueOnce(mockRunner().runner);
-    const host = new GraphileJobWorkerHost({} as Pool);
+    const host = new GraphileJobWorkerHost({} as Pool, { poolCheck: allowUnownedDouble });
     const error = new Error("fixture setup failure");
     const target = handlers();
     target["run.continue"] = async () => {
@@ -687,7 +706,10 @@ describe("GraphileJobWorkerHost runner lifecycle", () => {
   it("rechecks memory freed by GC while resident agents remain active", async () => {
     vi.useFakeTimers();
     run.mockResolvedValueOnce(mockRunner().runner);
-    const host = new GraphileJobWorkerHost({} as Pool, { concurrency: 1 });
+    const host = new GraphileJobWorkerHost({} as Pool, {
+      poolCheck: allowUnownedDouble,
+      concurrency: 1,
+    });
     const release = deferred();
     let entered = 0;
     const target = handlers();
@@ -715,7 +737,7 @@ describe("GraphileJobWorkerHost runner lifecycle", () => {
 
   it("observes a failure after handoff, reports it once and drains tracking", async () => {
     run.mockResolvedValueOnce(mockRunner().runner);
-    const host = new GraphileJobWorkerHost({} as Pool);
+    const host = new GraphileJobWorkerHost({} as Pool, { poolCheck: allowUnownedDouble });
     const lateFailure = deferred();
     const sink = createTestSink();
     installLogger(createLogger({ service: "test", sinks: [sink] }));
@@ -749,6 +771,7 @@ describe("GraphileJobWorkerHost runner lifecycle", () => {
     run.mockResolvedValueOnce(first.runner).mockResolvedValueOnce(second.runner);
     const sleeps: number[] = [];
     const host = new GraphileJobWorkerHost({} as Pool, {
+      poolCheck: allowUnownedDouble,
       sleep: async (ms) => {
         sleeps.push(ms);
       },
@@ -771,6 +794,7 @@ describe("GraphileJobWorkerHost runner lifecycle", () => {
     run.mockResolvedValueOnce(first.runner).mockResolvedValueOnce(second.runner);
     const sleeps: number[] = [];
     const host = new GraphileJobWorkerHost({} as Pool, {
+      poolCheck: allowUnownedDouble,
       sleep: async (ms) => {
         sleeps.push(ms);
       },
@@ -794,6 +818,7 @@ describe("GraphileJobWorkerHost runner lifecycle", () => {
       .mockResolvedValueOnce(recovered.runner);
     const sleeps: number[] = [];
     const host = new GraphileJobWorkerHost({} as Pool, {
+      poolCheck: allowUnownedDouble,
       sleep: async (ms) => {
         sleeps.push(ms);
       },
@@ -812,6 +837,7 @@ describe("GraphileJobWorkerHost runner lifecycle", () => {
     const first = mockRunner();
     run.mockResolvedValueOnce(first.runner);
     const host = new GraphileJobWorkerHost({} as Pool, {
+      poolCheck: allowUnownedDouble,
       sleep: async () => undefined,
     });
     await host.start(handlers());
@@ -830,6 +856,7 @@ describe("GraphileJobWorkerHost runner lifecycle", () => {
     const sink = createTestSink();
     installLogger(createLogger({ service: "rakazo-worker", sinks: [sink] }));
     const host = new GraphileJobWorkerHost({} as Pool, {
+      poolCheck: allowUnownedDouble,
       sleep: async () => undefined,
     });
 
@@ -890,6 +917,7 @@ describe("GraphileJobWorkerHost runner lifecycle", () => {
     run.mockResolvedValueOnce(first.runner);
     const sleepStarted = deferred();
     const host = new GraphileJobWorkerHost({} as Pool, {
+      poolCheck: allowUnownedDouble,
       sleep: () => {
         sleepStarted.resolve();
         return new Promise(() => undefined);

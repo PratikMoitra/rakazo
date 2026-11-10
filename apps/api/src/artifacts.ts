@@ -1,3 +1,4 @@
+// Modified in the isolated phase-1 workspace slice (Apache-2.0; see LICENSE). Not an upstream Rakazo release.
 import { createHash } from "node:crypto";
 import type { ArtifactStore, MessagingInboundAttachment } from "@rakazo/adapter-kit";
 import { createAdapterContext } from "@rakazo/adapter-kit";
@@ -9,6 +10,7 @@ import {
   attachmentSizeLabel,
   isAttachmentAudioMimeType,
   MCP_APP_MIME_TYPE,
+  UPLOAD_TOO_LARGE_CODE,
 } from "@rakazo/contracts";
 import {
   AttachmentValidationError,
@@ -78,6 +80,7 @@ export async function storeInboundAttachment(
   const maxBytes = deps.maxUploadSizeBytes ?? ATTACHMENT_MAX_BYTES;
   const tooLarge = new AttachmentValidationError(
     `Attachment exceeds the ${attachmentSizeLabel(maxBytes)} limit`,
+    UPLOAD_TOO_LARGE_CODE,
   );
   if ((attachment.size ?? 0) > maxBytes) throw tooLarge;
   const timeoutMs = Math.min(2_000, (input.downloadDeadline ?? Infinity) - Date.now());

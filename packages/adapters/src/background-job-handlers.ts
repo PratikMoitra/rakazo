@@ -26,6 +26,7 @@ import { pollCloudAgent } from "./cloud-agent-poll.js";
 import { expireComputerControl, scheduleComputerControlExpiry } from "./computer-control.js";
 import { rateLimitEnds, scheduleComputerSleep, sleepComputerIfIdle } from "./computer-idle.js";
 import { performComputerUpdate } from "./computer-update.js";
+import { cleanupErrorCode } from "./credential-cleanup.js";
 import type { createRunExecutor } from "./executor.js";
 import type { ExpoPushProvider } from "./expo-push.js";
 import { compactHistory } from "./history-compaction.js";
@@ -78,6 +79,8 @@ export function createBackgroundJobHandlers(deps: {
   notifications?: ExpoPushProvider;
   mediaGeneration?: MediaGenerationProvider;
   maxUploadSizeBytes?: number;
+  /** Resolves a protected tombstone. The queue payload is only the work item id. */
+  cleanupRetiredCredential?: (workItemId: string) => Promise<void>;
 }): BackgroundJobHandlers {
   const messagingDeps = deps.messaging
     ? {
@@ -149,18 +152,14 @@ export function createBackgroundJobHandlers(deps: {
         });
       }
     }),
-    "messaging.credential-cleanup": async ({ installationId, ref }) => {
-      await runAsSystem("clean up a retired messaging credential", async () => {
-        const installation = await deps.prisma.messagingInstallation.findUnique({
-          where: { id: installationId },
-          select: { ciphertext: true },
-        });
-        if (installation?.ciphertext === ref) return;
-        await deps.secretStore.delete(ref, {
-          recordId: installationId,
-          signal: AbortSignal.timeout(10_000),
-        });
-      });
+    "messaging.credential-cleanup": async ({ workItemId }) => {
+      if (!deps.cleanupRetiredCredential) throw new Error("credential_cleanup_failed");
+      try {
+        await deps.cleanupRetiredCredential(workItemId);
+      } catch (error) {
+        if (error instanceof Error && cleanupErrorCode(error.message)) throw error;
+        throw new Error("credential_cleanup_failed");
+      }
     },
     "messaging.deliver": async ({ runId }) => {
       if (runId && messagingDeps) {

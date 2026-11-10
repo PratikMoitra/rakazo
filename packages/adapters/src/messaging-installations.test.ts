@@ -77,13 +77,25 @@ function fixture() {
     delete: vi.fn(async () => undefined),
   } as unknown as SecretStore;
   const cleanupJobs = { enqueue: vi.fn(async () => undefined) };
+  const retirement = {
+    capture: vi.fn(async () => "5b0b5a6e-3e2a-4f5b-9c1d-6a7b8c9d0e1f"),
+    enqueue: vi.fn(async () => undefined),
+  };
+  const credentials = {
+    register: vi.fn(async () => undefined),
+    recordOrphan: vi.fn(async () => undefined),
+    retirement,
+  };
   return {
     cleanupJobs,
+    retirement,
+    credentials,
     manager: new MessagingInstallations(
       prisma as unknown as PrismaClient,
       secrets,
       provider,
       cleanupJobs,
+      credentials,
     ),
     prisma,
     provider,
@@ -200,7 +212,9 @@ it("disconnects only the user's own installation, from any of their spaces", asy
     },
   });
   expect(f.getInstallation()).toBeNull();
-  expect(f.secrets.delete).toHaveBeenCalledWith("sealed-token", "installation-a");
+  expect(f.retirement.capture).toHaveBeenCalledWith(expect.anything(), "installation-a");
+  expect(f.retirement.enqueue).toHaveBeenCalled();
+  expect(f.secrets.delete).not.toHaveBeenCalled();
 });
 it("does not load credentials after the installation owner loses membership", async () => {
   const f = fixture();
@@ -227,7 +241,9 @@ it("removes an old secret reference after a successful reconnect", async () => {
     ciphertext: "replacement",
   });
   await f.manager.complete(actor, await begin(f), "code");
-  expect(f.secrets.delete).toHaveBeenCalledWith("sealed-token", id);
+  expect(f.retirement.capture).toHaveBeenCalledWith(expect.anything(), id);
+  expect(f.retirement.enqueue).toHaveBeenCalled();
+  expect(f.secrets.delete).not.toHaveBeenCalled();
   expect(f.getInstallation()?.ciphertext).toBe("replacement");
 });
 
@@ -236,7 +252,12 @@ it("removes an unreferenced secret if persisting an installation fails", async (
   const state = await begin(f);
   f.prisma.messagingInstallation.create.mockRejectedValueOnce(new Error("write failed"));
   await expect(f.manager.complete(actor, state, "code")).rejects.toThrow("write failed");
-  expect(f.secrets.delete).toHaveBeenCalledWith("sealed-token", expect.any(String));
+  expect(f.credentials.recordOrphan).toHaveBeenCalledWith(
+    "sealed-token",
+    expect.any(String),
+    expect.any(String),
+  );
+  expect(f.secrets.delete).not.toHaveBeenCalled();
 });
 
 it("does not delete a credential when a write committed before a transport error", async () => {
@@ -265,7 +286,9 @@ it("disconnects installations and deletes their secret references before destroy
   expect(f.prisma.messagingInstallation.findMany).toHaveBeenCalledWith({
     where: { botId: "bot-a", spaceId: actor.spaceId, userId: actor.userId },
   });
-  expect(f.secrets.delete).toHaveBeenCalledWith("remote-reference", "install-a");
+  expect(f.retirement.capture).toHaveBeenCalledWith(expect.anything(), "install-a");
+  expect(f.retirement.enqueue).toHaveBeenCalled();
+  expect(f.secrets.delete).not.toHaveBeenCalled();
 });
 
 it("keeps a completed reconnect successful when external cleanup needs a retry", async () => {
@@ -273,25 +296,20 @@ it("keeps a completed reconnect successful when external cleanup needs a retry",
   await f.manager.complete(actor, await begin(f), "code");
   const id = f.getInstallation()!.id as string;
   vi.mocked(f.secrets.put).mockResolvedValueOnce({ id, ref: "new-ref", ciphertext: "new-ref" });
-  vi.mocked(f.secrets.delete).mockRejectedValueOnce(new Error("secret store unavailable"));
-  await expect(f.manager.complete(actor, await begin(f), "code")).resolves.toBeUndefined();
-  expect(f.getInstallation()?.ciphertext).toBe("new-ref");
-  expect(f.cleanupJobs.enqueue).toHaveBeenCalledWith(
-    expect.objectContaining({
-      name: "messaging.credential-cleanup",
-      payload: { installationId: id, ref: "sealed-token" },
-    }),
+  f.retirement.capture.mockRejectedValueOnce(new Error("retirement failed"));
+  await expect(f.manager.complete(actor, await begin(f), "code")).rejects.toThrow(
+    "retirement failed",
   );
+  expect(f.getInstallation()?.ciphertext).toBe("sealed-token");
+  expect(f.retirement.enqueue).not.toHaveBeenCalled();
 });
 
 it("keeps a completed disconnect successful when external cleanup needs a retry", async () => {
   const f = fixture();
   await f.manager.complete(actor, await begin(f), "code");
   const id = f.getInstallation()!.id as string;
-  vi.mocked(f.secrets.delete).mockRejectedValueOnce(new Error("secret store unavailable"));
-  await expect(f.manager.remove(actor, id)).resolves.toBeUndefined();
-  expect(f.getInstallation()).toBeNull();
-  expect(f.cleanupJobs.enqueue).toHaveBeenCalledWith(
-    expect.objectContaining({ payload: { installationId: id, ref: "sealed-token" } }),
-  );
+  f.retirement.capture.mockRejectedValueOnce(new Error("retirement failed"));
+  await expect(f.manager.remove(actor, id)).rejects.toThrow("retirement failed");
+  expect(f.getInstallation()).not.toBeNull();
+  expect(f.retirement.enqueue).not.toHaveBeenCalled();
 });

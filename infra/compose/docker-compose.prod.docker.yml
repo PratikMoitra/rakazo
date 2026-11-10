@@ -59,7 +59,8 @@ services:
         max-size: "10m"
         max-file: "3"
     environment:
-      MAX_UPLOAD_SIZE_MB: ${MAX_UPLOAD_SIZE_MB:-10}
+      # Phase-1 workspace slice: unset value is 25 MiB (26214400 bytes). Historical fallback was 10.
+      MAX_UPLOAD_SIZE_MB: ${MAX_UPLOAD_SIZE_MB:-25}
       NODE_ENV: production
       DATA_DIR: /data
       SUPERVISOR_HOST: "0.0.0.0"

@@ -1,3 +1,4 @@
+// Modified in the isolated phase-1 workspace slice (Apache-2.0; see LICENSE). Not an upstream Rakazo release.
 import type {
   AnyContractProcedure,
   InferContractRouterInputs,
@@ -153,6 +154,7 @@ import {
   UpdateBotInput,
   UpdateExternalConversationPolicyInput,
   UpdateGroupInput,
+  UploadPolicySchema,
   UsageRecordSchema,
   UsageSummarySchema,
   VoiceCatalogEntrySchema,
@@ -438,6 +440,12 @@ export const appContract = {
       .output(z.object({ ok: z.literal(true), activeSpaceId: Id })),
   },
   bootstrap: oc.input(z.object({ botId: Id.optional() })).output(AppBootstrapSchema),
+  uploadPolicy: {
+    get: oc.output(UploadPolicySchema),
+    set: oc
+      .input(z.object({ maxFileBytes: z.number().int().positive() }))
+      .output(UploadPolicySchema),
+  },
   deployment: {
     get: oc.output(DeploymentSettingsSchema),
     update: oc

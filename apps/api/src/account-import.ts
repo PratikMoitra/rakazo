@@ -1,3 +1,4 @@
+// Modified in the isolated phase-1 workspace slice (Apache-2.0; see LICENSE). Not an upstream Rakazo release.
 import { createHash, randomUUID } from "node:crypto";
 import type { WriteStream } from "node:fs";
 import { createReadStream, createWriteStream } from "node:fs";
@@ -44,6 +45,7 @@ import { inflateEntry, parseZipArchive, readExact, ZipFormatError } from "./acco
 import { cancelBody } from "./http-body.js";
 import type { SpaceDeletionDeps } from "./space-deletion.js";
 import { deleteSpaceWithContent } from "./space-deletion.js";
+import { currentUploadPolicy } from "./upload-policy.js";
 
 export const ACCOUNT_IMPORT_LIMITS = {
   /** The uploaded zip as sent. */
@@ -83,7 +85,10 @@ const outOfOrder = () => new AccountImportError("The export's files are out of o
 const missingRecord = () => new AccountImportError("The export refers to a missing record.");
 const tooLarge = () => new AccountImportError("The export is too large.", 413);
 
-export type AccountImportDeps = SpaceDeletionDeps & { maxArtifactBytes: number };
+export type AccountImportDeps = SpaceDeletionDeps & {
+  maxArtifactBytes: number;
+  uploadSizeExplicit?: boolean;
+};
 
 export type ArchiveEntry =
   | { kind: "manifest" }
@@ -1141,9 +1146,18 @@ export function mountAccountImportRoute(
       return c.json({ error: tooLarge().message }, 413);
     }
     try {
+      const maxArtifactBytes = (
+        await currentUploadPolicy({
+          prisma: deps.prisma,
+          env: {
+            maxUploadSizeBytes: deps.maxArtifactBytes,
+            uploadSizeExplicit: deps.uploadSizeExplicit,
+          },
+        })
+      ).maxFileBytes;
       return c.json(
         await importAccount(
-          deps,
+          { ...deps, maxArtifactBytes },
           actor,
           boundedBody(request.body, ACCOUNT_IMPORT_LIMITS.bodyBytes),
         ),

@@ -8,11 +8,18 @@ import type {
 } from "@rakazo/adapter-kit";
 import { dispatchBackgroundJob } from "@rakazo/adapter-kit";
 import type { PrismaClient } from "@rakazo/db";
-import { isPoolCheckoutTimeout, isTooManyDatabaseConnections, runAsSystem } from "@rakazo/db";
+import {
+  assertApprovedPool,
+  isPoolCheckoutTimeout,
+  isTooManyDatabaseConnections,
+  openFixturePool,
+  runAsSystem,
+} from "@rakazo/db";
 import { getLogger, runCorrelatedJob, unwrapJobPayload, wrapJobPayload } from "@rakazo/logging";
 import type { Runner, WorkerUtils } from "graphile-worker";
 import { makeWorkerUtils, run } from "graphile-worker";
 import type { Pool } from "pg";
+import { cleanupErrorCode } from "./credential-cleanup.js";
 import { recordHistoryCompactAttemptsExhausted } from "./history-compaction.js";
 import { RunExecutionHost } from "./run-execution.js";
 
@@ -21,6 +28,10 @@ import { RunExecutionHost } from "./run-execution.js";
 const INTERACTIVE_RUN_TASK = "run.interactive";
 type RunLookup = Pick<PrismaClient, "run">;
 type Workload = "interactive" | "background" | "maintenance";
+
+function requireFixturePool(pool: Pool, check: (pool: Pool) => void = assertApprovedPool): void {
+  check(pool);
+}
 
 async function isInteractiveRun(prisma: RunLookup, runId: string): Promise<boolean> {
   const run = await prisma.run.findUnique({ where: { id: runId }, select: { trigger: true } });
@@ -50,7 +61,10 @@ export class GraphileJobPublisher implements JobPublisher {
   constructor(
     private readonly pgPool: Pool,
     private readonly prisma?: RunLookup,
-  ) {}
+    poolCheck?: (pool: Pool) => void,
+  ) {
+    requireFixturePool(pgPool, poolCheck);
+  }
 
   async enqueue(job: BackgroundJob): Promise<void> {
     const utils = await this.getUtils();
@@ -162,11 +176,19 @@ function dispatchJob(
  * `pnpm db:migrate`, so the runtime role only needs grants on that schema.
  */
 export async function migrateJobQueue(connectionString: string): Promise<void> {
-  const utils = await makeWorkerUtils({ connectionString });
+  const pool = openFixturePool(connectionString, {
+    max: 1,
+    applicationName: "rakazo-queue-migrate",
+  });
   try {
-    await utils.migrate();
+    const utils = await makeWorkerUtils({ pgPool: pool });
+    try {
+      await utils.migrate();
+    } finally {
+      await utils.release();
+    }
   } finally {
-    await utils.release();
+    await pool.end();
   }
 }
 
@@ -228,8 +250,14 @@ export class GraphileJobWorkerHost implements JobWorkerHost {
       sleep?: (ms: number) => Promise<void>;
       /** Test seam for JOB_DRAIN_TIMEOUT_MS. */
       drainTimeoutMs?: number;
+      /** Registers the opaque credential-cleanup dispatcher. Off unless the worker login is distinct. */
+      credentialCleanup?: boolean;
+      /** Test double injection. Production callers leave this unset. */
+      poolCheck?: (pool: Pool) => void;
     } = {},
-  ) {}
+  ) {
+    requireFixturePool(pgPool, options.poolCheck);
+  }
 
   async start(handlers: BackgroundJobHandlers): Promise<void> {
     if (this.runner || this.superviseTask) return;
@@ -321,6 +349,34 @@ export class GraphileJobWorkerHost implements JobWorkerHost {
         ]),
     );
     if (!this.options.workload) taskList[INTERACTIVE_RUN_TASK] = taskList["run.continue"]!;
+    if (
+      this.options.credentialCleanup &&
+      this.options.workload !== "interactive" &&
+      this.options.workload !== "background"
+    ) {
+      taskList["work.dispatch"] = async (payload: unknown) => {
+        const unpacked = unwrapJobPayload(payload);
+        const body = unpacked.payload;
+        const workItemId =
+          body && typeof body === "object" && "workItemId" in body ? body.workItemId : undefined;
+        const extra =
+          body && typeof body === "object"
+            ? Object.keys(body).filter((key) => key !== "workItemId")
+            : ["invalid"];
+        if (typeof workItemId !== "string" || extra.length > 0) throw new Error("work_rejected");
+        try {
+          await dispatchJob(handlers, "messaging.credential-cleanup", { workItemId });
+        } catch (error) {
+          if (
+            error instanceof Error &&
+            (error.message === "work_rejected" || cleanupErrorCode(error.message))
+          ) {
+            throw error;
+          }
+          throw new Error("credential_cleanup_failed");
+        }
+      };
+    }
     const runner = await run({
       pgPool: this.pgPool,
       concurrency: this.options.concurrency ?? 4,
@@ -411,7 +467,12 @@ const MAINTENANCE_LOCAL_QUEUE_SIZE = 10;
 /** Long agent turns cannot occupy the capacity reserved for other workloads. */
 export function createReservedGraphileJobWorkerHost(
   pool: Pool,
-  options: { concurrency?: number; pollInterval?: number } = {},
+  options: {
+    concurrency?: number;
+    pollInterval?: number;
+    credentialCleanup?: boolean;
+    poolCheck?: (pool: Pool) => void;
+  } = {},
 ): JobWorkerHost {
   const hosts = (["interactive", "background", "maintenance"] as const).map(
     (workload) =>

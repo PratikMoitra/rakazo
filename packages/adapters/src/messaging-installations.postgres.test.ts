@@ -2,8 +2,11 @@ import { randomUUID } from "node:crypto";
 import type { Actor } from "@rakazo/contracts";
 import type { PrismaClient } from "@rakazo/db";
 import {
+  acceptanceChannels,
   asSystem,
+  assertRuntimeRowSecurity,
   createDb,
+  installQueueBoundary,
   provisionMessagingIdentity,
   runAsSystem,
   runAsTenant,
@@ -11,12 +14,19 @@ import {
   teamChatRunFromOwner,
 } from "@rakazo/db";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import {
+  captureCredentialRetirement,
+  enqueueCredentialRetirement,
+  recordOrphanCredential,
+  registerActiveCredential,
+} from "./credential-cleanup.js";
 import { MessagingInstallations } from "./messaging-installations.js";
 import { EncryptedSecretStore } from "./secrets.js";
 import { SlackInstallProvider } from "./slack-install-provider.js";
 
-const describePostgres =
-  process.env.VERIFY_DATABASE && process.env.DATABASE_URL ? describe.sequential : describe.skip;
+// The owned runner sets RAKAZO_OWNED_FIXTURE_ID. A supplied DATABASE_URL is not enough.
+const channels = acceptanceChannels();
+const describePostgres = channels ? describe.sequential : describe.skip;
 describePostgres("messaging workspace installation (PostgreSQL)", () => {
   let prisma: PrismaClient;
   let close: () => Promise<void>;
@@ -39,12 +49,13 @@ describePostgres("messaging workspace installation (PostgreSQL)", () => {
     );
 
   beforeAll(async () => {
-    const db = createDb(process.env.DATABASE_URL!);
+    const db = createDb(channels!.databaseUrl);
     prisma = db.prisma;
     close = async () => {
       await prisma.$disconnect();
       await db.pool.end();
     };
+    await assertRuntimeRowSecurity(prisma);
     for (let i = 0; i < 2; i++) {
       const ids = await runAsSystem("messaging install fixtures", () =>
         provisionMessagingIdentity(
@@ -61,6 +72,7 @@ describePostgres("messaging workspace installation (PostgreSQL)", () => {
       });
       bots.push(ids.botId);
     }
+    await installQueueBoundary(channels!.migrationUrl);
     manager = new MessagingInstallations(
       prisma,
       new EncryptedSecretStore("fake-test-encryption-key"),
@@ -73,6 +85,17 @@ describePostgres("messaging workspace installation (PostgreSQL)", () => {
         },
         fetcher,
       ),
+      undefined,
+      {
+        register: (tx, installationId, objectKey) =>
+          registerActiveCredential(tx, installationId, objectKey),
+        recordOrphan: (objectKey, installationId, recordId) =>
+          recordOrphanCredential(prisma, objectKey, installationId, recordId),
+        retirement: {
+          capture: (tx, installationId) => captureCredentialRetirement(tx, installationId),
+          enqueue: (tx, workItemId) => enqueueCredentialRetirement(tx, workItemId),
+        },
+      },
     );
   });
   afterAll(async () => {
@@ -288,8 +311,10 @@ describePostgres("messaging workspace installation (PostgreSQL)", () => {
     const personal = await asSystem(prisma).bot.create({
       data: { spaceId: actor.spaceId, userId: actor.userId, name: "Personal", color: "ink" },
     });
+    await registerActiveCredential(prisma, "phase1-cascade", "fake-unused-ciphertext");
     const installation = await asSystem(prisma).messagingInstallation.create({
       data: {
+        id: "phase1-cascade",
         provider: "slack",
         workspaceId: "T-CASCADE",
         workspaceName: "Example workspace",

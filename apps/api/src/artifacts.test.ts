@@ -1,3 +1,4 @@
+// Modified in the isolated phase-1 workspace slice (Apache-2.0; see LICENSE). Not an upstream Rakazo release.
 import type { ArtifactStore } from "@rakazo/adapter-kit";
 import type { Actor } from "@rakazo/contracts";
 import type { PrismaClient } from "@rakazo/db";
@@ -453,7 +454,10 @@ describe("configured artifact upload limit", () => {
         mimeType: "text/plain",
         contentBase64: Buffer.alloc(size).toString("base64"),
       });
-    await expect(upload(deps.maxUploadSizeBytes + 1)).rejects.toThrow("12 MiB limit");
+    await expect(upload(deps.maxUploadSizeBytes + 1)).rejects.toMatchObject({
+      code: "upload_too_large",
+      message: expect.stringContaining("12 MiB limit"),
+    });
     expect(put).not.toHaveBeenCalled();
     await expect(upload(deps.maxUploadSizeBytes)).rejects.toBe(stored);
     expect(put).toHaveBeenCalledOnce();

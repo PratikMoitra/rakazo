@@ -1,3 +1,4 @@
+// Modified in the isolated phase-1 workspace slice (Apache-2.0; see LICENSE). Not an upstream Rakazo release.
 import { AsyncLocalStorage } from "node:async_hooks";
 import { hostname } from "node:os";
 import { ORPCError, onError } from "@orpc/server";
@@ -38,6 +39,7 @@ import {
   ChatSdkMessagingSurface,
   CodexCatalogCache,
   ComposioConnector,
+  captureCredentialRetirement,
   contentKeyProviderFromEnv,
   createAgentHomeStore,
   createApnsVoipProvider,
@@ -65,6 +67,7 @@ import {
   deploymentModelUsageLookup,
   EmailEmulator,
   ExpoPushProvider,
+  enqueueCredentialRetirement,
   GraphileJobPublisher,
   InMemoryJobQueue,
   InMemoryRealtimeFanout,
@@ -91,6 +94,8 @@ import {
   reconcileComputerUpdates,
   reconcileMediaVideos,
   reconcilePurchases,
+  recordOrphanCredential,
+  registerActiveCredential,
   removePiUserSessions,
   resolveDeploymentModel,
   ScriptedAgentRuntime,
@@ -123,12 +128,14 @@ import {
 import { encryptionKeyWarning, signupPolicyFromEnv } from "@rakazo/core";
 import type { Pool, PrismaClient } from "@rakazo/db";
 import {
+  assertFixtureDatabaseEnv,
   configureProviderTransactionPool,
   createBoardEvents,
   createDb,
   createPool,
   createSecurityEventPruner,
   createThreadEvents,
+  credentialWorkerTarget,
   describeRowSecurity,
   IsolationError,
   installAuditEventStore,
@@ -212,6 +219,7 @@ import {
   TEAM_CHAT_STARTUP_SHUTDOWN_MS,
   TeamChatStartupRetries,
 } from "./team-chat-startup.js";
+import { currentUploadPolicy } from "./upload-policy.js";
 import { endUserDeviceSession, mountUserDeviceRoutes } from "./user-devices.js";
 import { mountVoiceHttpRoutes, transcribeInboundVoice, voiceAccountErrorStatus } from "./voice.js";
 import { mountWebhookHttpRoutes } from "./webhook.js";
@@ -311,6 +319,13 @@ async function buildApp(overrides: CreateAppOverrides): Promise<AppHandles> {
   installLogger(logger);
   const poolMax = parsePositiveInteger(process.env.DB_POOL_MAX, 4);
   configureProviderTransactionPool(poolMax);
+  if (!prismaOverride) {
+    assertFixtureDatabaseEnv({
+      ...process.env,
+      DATABASE_URL: env.databaseUrl,
+      REALTIME_DATABASE_URL: env.realtimeDatabaseUrl,
+    });
+  }
   const created = prismaOverride
     ? { prisma: prismaOverride, pool: undefined }
     : createDb(env.databaseUrl, {
@@ -469,7 +484,22 @@ async function buildApp(overrides: CreateAppOverrides): Promise<AppHandles> {
       : undefined);
   const { messaging, installations: messagingInstallations } = messagingOverride
     ? { messaging: messagingOverride, installations: undefined }
-    : installedMessaging(prisma, secrets, env, legacyMessaging, jobs);
+    : installedMessaging(prisma, secrets, env, legacyMessaging, jobs, {
+        register: (tx, installationId, objectKey) =>
+          registerActiveCredential(tx, installationId, objectKey),
+        recordOrphan: (objectKey, installationId, recordId) =>
+          recordOrphanCredential(prisma, objectKey, installationId, recordId),
+        ...(credentialWorkerTarget(env.databaseUrl, process.env.DATABASE_WORKER_URL).mode === "on"
+          ? {
+              retirement: {
+                capture: (tx: Parameters<typeof captureCredentialRetirement>[0], id: string) =>
+                  captureCredentialRetirement(tx, id),
+                enqueue: (tx: Parameters<typeof enqueueCredentialRetirement>[0], id: string) =>
+                  enqueueCredentialRetirement(tx, id),
+              },
+            }
+          : {}),
+      });
   const configuredEmail = emailOverride ?? configuredEmailProvider(env);
   const localEmailEmulator =
     !configuredEmail && env.emailEmulator
@@ -684,6 +714,7 @@ async function buildApp(overrides: CreateAppOverrides): Promise<AppHandles> {
   const executor = createRunExecutor({
     billingEnabled: modelCreditsEnabled,
     maxUploadSizeBytes: env.maxUploadSizeBytes,
+    uploadSizeExplicit: env.uploadSizeExplicit,
     mediaGeneration,
     contextStrategy,
     prisma,
@@ -901,6 +932,7 @@ async function buildApp(overrides: CreateAppOverrides): Promise<AppHandles> {
       navLinks: env.navLinks,
       adminEmails: env.adminEmails,
       maxUploadSizeBytes: env.maxUploadSizeBytes,
+      uploadSizeExplicit: env.uploadSizeExplicit,
       maxAttachmentsPerMessage: env.maxAttachmentsPerMessage,
       agentRuntime: env.agentRuntime,
       defaultProvider: env.defaultProvider,
@@ -1160,6 +1192,7 @@ async function buildApp(overrides: CreateAppOverrides): Promise<AppHandles> {
       dataDir: env.dataDir,
       messagingInstallations,
       maxArtifactBytes: env.maxUploadSizeBytes,
+      uploadSizeExplicit: env.uploadSizeExplicit,
     },
     sessionActor,
   );
@@ -1170,9 +1203,13 @@ async function buildApp(overrides: CreateAppOverrides): Promise<AppHandles> {
       events,
       jobs,
       ...env.inboundEmail,
-      storeAttachment: ({ spaceId, userId, ...input }) =>
+      storeAttachment: async ({ spaceId, userId, ...input }) =>
         storeInboundAttachment(
-          { prisma, artifacts, maxUploadSizeBytes: env.maxUploadSizeBytes },
+          {
+            prisma,
+            artifacts,
+            maxUploadSizeBytes: (await currentUploadPolicy({ prisma, env })).maxFileBytes,
+          },
           { spaceId, userId },
           input,
         ),
@@ -1211,9 +1248,13 @@ async function buildApp(overrides: CreateAppOverrides): Promise<AppHandles> {
         signupAllowlist: env.signupAllowlist,
       },
       acknowledge: receipts?.acknowledge,
-      storeAttachment: ({ spaceId, userId, ...input }) =>
+      storeAttachment: async ({ spaceId, userId, ...input }) =>
         storeInboundAttachment(
-          { prisma, artifacts, maxUploadSizeBytes: env.maxUploadSizeBytes },
+          {
+            prisma,
+            artifacts,
+            maxUploadSizeBytes: (await currentUploadPolicy({ prisma, env })).maxFileBytes,
+          },
           { spaceId, userId },
           input,
         ),
@@ -1351,9 +1392,13 @@ async function buildApp(overrides: CreateAppOverrides): Promise<AppHandles> {
         jobs,
         send: createMessagingTeamChatSender(messaging),
         fetchThreadHistory: createMessagingTeamChatHistory(messaging),
-        storeAttachment: ({ spaceId, userId, ...input }) =>
+        storeAttachment: async ({ spaceId, userId, ...input }) =>
           storeInboundAttachment(
-            { prisma, artifacts, maxUploadSizeBytes: env.maxUploadSizeBytes },
+            {
+              prisma,
+              artifacts,
+              maxUploadSizeBytes: (await currentUploadPolicy({ prisma, env })).maxFileBytes,
+            },
             { spaceId, userId },
             input,
           ),

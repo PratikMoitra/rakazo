@@ -15,6 +15,7 @@ export function installedMessaging(
   },
   fallback?: MessagingSurface,
   cleanupJobs?: Pick<JobPublisher, "enqueue">,
+  retirement?: ConstructorParameters<typeof MessagingInstallations>[4],
 ): { messaging: MessagingSurface | undefined; installations: MessagingInstallations | undefined } {
   if (
     (config.slackClientId || config.slackClientSecret) &&
@@ -39,7 +40,13 @@ export function installedMessaging(
     signingSecret: config.slackSigningSecret,
     redirectUri: new URL("/api/v1/messaging/install/slack/callback", config.apiUrl).toString(),
   });
-  const installations = new MessagingInstallations(prisma, secrets, provider, cleanupJobs);
+  const installations = new MessagingInstallations(
+    prisma,
+    secrets,
+    provider,
+    cleanupJobs,
+    retirement,
+  );
   return {
     messaging: new InstalledMessagingSurface(installations, provider, fallback),
     installations,

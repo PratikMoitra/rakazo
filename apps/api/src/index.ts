@@ -2,7 +2,9 @@ import type { Socket } from "node:net";
 import { unwrapEnvFromKeyManager } from "@rakazo/adapters";
 import { loadRootEnv } from "@rakazo/core/node/load-root-env";
 import { stopOnShutdownSignals } from "@rakazo/core/node/shutdown-signals";
+import { rejectPhase1FixtureFlags } from "@rakazo/db";
 
+rejectPhase1FixtureFlags(process.env);
 loadRootEnv();
 await unwrapEnvFromKeyManager();
 

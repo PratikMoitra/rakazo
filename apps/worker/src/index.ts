@@ -1,6 +1,9 @@
+// Modified in the isolated phase-1 workspace slice (Apache-2.0; see LICENSE). Not an upstream Rakazo release.
 import { hostname } from "node:os";
+import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import type { JobPublisher, JobWorkerHost } from "@rakazo/adapter-kit";
+import { pathToFileURL } from "node:url";
+import type { JobPublisher, JobWorkerHost, SecretStore } from "@rakazo/adapter-kit";
 import {
   ComposioConnector,
   IntegrationProviderSettings,
@@ -10,6 +13,7 @@ import { phoneCallSettings } from "@rakazo/core";
 import { loadRootEnv } from "@rakazo/core/node/load-root-env";
 import { stopOnShutdownSignals } from "@rakazo/core/node/shutdown-signals";
 import { startWorkerHealth, watchEventLoopStalls } from "./health.js";
+import { rejectPhase1FixtureFlags } from "./reject-phase1-fixtures.js";
 import { createWorkerSecretStore } from "./secret-store.js";
 
 loadRootEnv();
@@ -20,6 +24,7 @@ import {
   auditLogConfig,
   ChatSdkMessagingSurface,
   CodexCatalogCache,
+  captureCredentialRetirement,
   configuredEmailProvider,
   contentKeyProviderFromEnv,
   createAgentHomeStore,
@@ -49,6 +54,7 @@ import {
   databaseCapacityBackoffMs,
   deploymentModelUsageLookup,
   ExpoPushProvider,
+  enqueueCredentialRetirement,
   GraphileJobPublisher,
   homeStorageSweeper,
   InMemoryJobQueue,
@@ -66,6 +72,7 @@ import {
   PipedreamConnector,
   PostgresRealtimeFanout,
   PrismaPushTokenStore,
+  performCredentialCleanup,
   pipedreamConfigFromEnv,
   RunJobPublisher,
   RunStarter,
@@ -74,6 +81,8 @@ import {
   reconcileComputerUpdates,
   reconcileMediaVideos,
   reconcilePurchases,
+  recordOrphanCredential,
+  registerActiveCredential,
   resolveDeploymentModel,
   resolvePiSessionRoot,
   resolveSandboxProvider,
@@ -86,12 +95,16 @@ import {
   withRunWorker,
   withSecretPersistence,
 } from "@rakazo/adapters";
-import { resolveEncryptionKey, resolveSupervisorToken, uploadSizeFromEnv } from "@rakazo/core";
+import { resolveEncryptionKey, resolveSupervisorToken, uploadLimitFromEnv } from "@rakazo/core";
 import {
+  assertFixtureDatabaseEnv,
+  countLegacyCredentialJobs,
   createBoardEvents,
   createDb,
+  createPool,
   createSecurityEventPruner,
   createThreadEvents,
+  credentialWorkerTarget,
   describeRowSecurity,
   installAuditEventStore,
   installSecurityEventStore,
@@ -110,7 +123,9 @@ import { MarkdownMemoryStore } from "@rakazo/memory";
 
 const logger = await createRootLogger(SERVICE_NAMES.worker);
 
-async function main() {
+export async function startWorker(options?: { secretStore?: SecretStore }) {
+  rejectPhase1FixtureFlags(process.env);
+  assertFixtureDatabaseEnv(process.env);
   const stopStallWatch = watchEventLoopStalls();
   const databaseUrl = process.env.DATABASE_URL;
   if (!databaseUrl) throw new Error("DATABASE_URL is required");
@@ -128,6 +143,19 @@ async function main() {
     keyProvider: contentKeyProviderFromEnv(),
   });
   const { pool } = created;
+  const credentialWorker = credentialWorkerTarget(databaseUrl, process.env.DATABASE_WORKER_URL);
+  const queuePool =
+    credentialWorker.mode === "on"
+      ? createPool(credentialWorker.url, { applicationName: "rakazo-worker-queue" })
+      : pool;
+  if (process.env.WAKEUP_DRIVER !== "memory") {
+    const legacyJobs = await countLegacyCredentialJobs(queuePool);
+    if (legacyJobs > 0) {
+      throw new Error(
+        `credential cleanup refused to start: ${legacyJobs} legacy jobs are queued and conversion is not approved`,
+      );
+    }
+  }
   let { prisma } = created;
   const rowSecurity = rowSecurityWarning(await describeRowSecurity(prisma));
   if (rowSecurity) logger.warn(rowSecurity);
@@ -135,7 +163,7 @@ async function main() {
     connectionString: process.env.REALTIME_DATABASE_URL ?? databaseUrl,
     publisher: pool,
   });
-  const secrets = await createWorkerSecretStore(process.env, realtime);
+  const secrets = options?.secretStore ?? (await createWorkerSecretStore(process.env, realtime));
   if (secrets.describe().capabilities.degraded)
     logger.warn("Secret storage degraded; encrypted credentials remain available");
   prisma = withSecretPersistence(prisma, secrets);
@@ -242,7 +270,7 @@ async function main() {
   const inMemoryJobs = process.env.WAKEUP_DRIVER === "memory" ? new InMemoryJobQueue() : undefined;
   const runs = new RunStarter(realtime, { signal: shutdown.signal });
   const jobs: JobPublisher =
-    inMemoryJobs ?? new RunJobPublisher(prisma, new GraphileJobPublisher(pool, prisma), runs);
+    inMemoryJobs ?? new RunJobPublisher(prisma, new GraphileJobPublisher(queuePool, prisma), runs);
   const { messaging } = installedMessaging(
     prisma,
     secrets,
@@ -254,6 +282,22 @@ async function main() {
     },
     legacyMessaging,
     jobs,
+    {
+      register: (tx, installationId, objectKey) =>
+        registerActiveCredential(tx, installationId, objectKey),
+      recordOrphan: (objectKey, installationId, recordId) =>
+        recordOrphanCredential(prisma, objectKey, installationId, recordId),
+      ...(credentialWorker.mode === "on"
+        ? {
+            retirement: {
+              capture: (tx: Parameters<typeof captureCredentialRetirement>[0], id: string) =>
+                captureCredentialRetirement(tx, id),
+              enqueue: (tx: Parameters<typeof enqueueCredentialRetirement>[0], id: string) =>
+                enqueueCredentialRetirement(tx, id),
+            },
+          }
+        : {}),
+    },
   );
   const ticketChanges = createTicketChangeNotifier({
     boardEvents,
@@ -266,7 +310,8 @@ async function main() {
   const paymentWallet = await createPaymentWalletProvider();
   // One instance: the executor submits videos and background polls finish them.
   const mediaGeneration = createMediaGenerationProvider();
-  const maxUploadSizeBytes = uploadSizeFromEnv(process.env);
+  const uploadLimit = uploadLimitFromEnv(process.env);
+  const maxUploadSizeBytes = uploadLimit.maxUploadSizeBytes;
   // Shared with the reconciler so a stuck wait uses the same push path as a finish notice.
   const pushTokens = new PrismaPushTokenStore(prisma, resolveEncryptionKey(process.env));
   const notifications = new ExpoPushProvider(pushTokens, {
@@ -284,6 +329,7 @@ async function main() {
   });
   const executor = createRunExecutor({
     maxUploadSizeBytes,
+    uploadSizeExplicit: uploadLimit.explicit,
     mediaGeneration,
     prisma,
     runtime,
@@ -347,8 +393,9 @@ async function main() {
     inMemoryJobs ??
     withRunWorker(
       new RunWorkerHost(prisma, realtime, runs, { pool }),
-      createReservedGraphileJobWorkerHost(pool, {
+      createReservedGraphileJobWorkerHost(queuePool, {
         concurrency: parsePositiveInteger(process.env.GRAPHILE_WORKER_CONCURRENCY, 4),
+        credentialCleanup: credentialWorker.mode === "on",
       }),
     );
 
@@ -373,6 +420,11 @@ async function main() {
     notifications,
     mediaGeneration,
     maxUploadSizeBytes,
+    cleanupRetiredCredential:
+      credentialWorker.mode === "on"
+        ? (workItemId) =>
+            performCredentialCleanup({ pool: queuePool, secretStore: secrets }, workItemId)
+        : undefined,
   });
   const reconciler = createJobReconciler({
     prisma,
@@ -401,7 +453,7 @@ async function main() {
     reconcileAuditLog: createAuditLogReconciler(prisma, auditLogConfig()),
     reconcileHomeStorage: homeStorageSweeper(home),
     reconcileIdleComputers: createIdleComputerSweeper({ prisma, jobs }),
-    reconcileDeadJobs: inMemoryJobs ? undefined : createDeadJobPruner(pool),
+    reconcileDeadJobs: inMemoryJobs ? undefined : createDeadJobPruner(queuePool),
   });
   let stopHealth: (() => Promise<void>) | undefined;
   let stopping = false;
@@ -425,6 +477,7 @@ async function main() {
         await installedConnectors.close();
         await prisma.$disconnect().catch(() => undefined);
         await pool.end().catch(() => undefined);
+        if (queuePool !== pool) await queuePool.end().catch(() => undefined);
       } finally {
         await analytics?.flush();
         await shutdownPiTelemetry();
@@ -490,10 +543,17 @@ async function main() {
 // The worker only does cross-tenant work: job dispatch, reconcilers, leadership and
 // realtime, all keyed by ids rather than a signed-in user. This is its one
 // row-level security bypass; jobs re-enter it explicitly (see wakeup.ts).
-runAsSystem("worker process", main).catch(async (error) => {
-  logger.error("worker startup failed", error);
-  await logger.flush({ timeoutMs: 2_000 });
-  // jobHost.start retries 53300 without bound above, so a saturated Postgres at
-  // that step does not reach here. Other startup failures still exit.
-  process.exit(1);
-});
+const invokedDirectly =
+  process.argv[1] !== undefined &&
+  import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
+
+if (invokedDirectly) {
+  runAsSystem("worker process", () => startWorker()).catch(async (error) => {
+    process.stderr.write(`${error instanceof Error ? error.message : "worker startup failed"}\n`);
+    logger.error("worker startup failed", error);
+    await logger.flush({ timeoutMs: 2_000 });
+    // jobHost.start retries 53300 without bound above, so a saturated Postgres at
+    // that step does not reach here. Other startup failures still exit.
+    process.exit(1);
+  });
+}

@@ -29,8 +29,7 @@ const payloadSchemas = {
   }),
   "messaging.deliver": z.object({ runId: z.string().min(1).optional() }),
   "messaging.credential-cleanup": z.object({
-    installationId: z.string().min(1),
-    ref: z.string().min(1),
+    workItemId: z.string().uuid(),
   }),
   "cloud_agent.poll": z.object({ agentId: z.string().min(1) }),
   "purchase.poll": z.object({ purchaseId: z.string().min(1) }),

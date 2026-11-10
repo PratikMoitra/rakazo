@@ -1,3 +1,4 @@
+// Modified in the isolated phase-1 workspace slice (Apache-2.0; see LICENSE). Not an upstream Rakazo release.
 import { randomBytes } from "node:crypto";
 import { copyFile, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -27,6 +28,24 @@ describe("LocalArtifactStore", () => {
 
     const info = await stat(path.join(root, "artifacts", "space-1", stored.id));
     expect(info.mode & 0o777).toBe(0o600);
+  });
+
+  it("stores a traversal-like name under the space id and does not write outside it", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "rakazo-artifacts-"));
+    dirs.push(root);
+    const store = new LocalArtifactStore(root);
+    const stored = await store.put(
+      {
+        name: "../../etc/passwd",
+        mimeType: "text/plain",
+        bytes: new TextEncoder().encode("nope"),
+      },
+      context,
+    );
+    const file = path.join(root, "artifacts", "space-1", stored.id);
+    expect(stored.id).not.toContain("..");
+    expect(await readFile(file, "utf8")).toBe("nope");
+    await expect(stat(path.join(root, "etc", "passwd"))).rejects.toThrow();
   });
 
   it("does not follow a replacement symlink when reading an artifact", async () => {

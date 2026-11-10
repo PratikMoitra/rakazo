@@ -1,0 +1,130 @@
+// Phase-1 addition for the isolated workspace slice. Apache-2.0; see LICENSE. Not an upstream Rakazo file.
+import {
+  DEFAULT_UPLOAD_MAX_BYTES,
+  UPLOAD_POLICY_INVALID_CODE,
+  UPLOAD_POLICY_LOCKED_CODE,
+} from "@rakazo/contracts";
+import { describe, expect, it } from "vitest";
+import { AttachmentValidationError } from "./attachments.js";
+import { effectiveUploadPolicy, proposeUploadPolicyChange } from "./upload-policy.js";
+
+const MIB = 1024 * 1024;
+
+describe("effectiveUploadPolicy", () => {
+  it("lets an explicit environment value win over a stored limit", () => {
+    expect(
+      effectiveUploadPolicy({
+        ceilingBytes: 10 * MIB,
+        envExplicit: true,
+        persistedBytes: MIB,
+      }),
+    ).toEqual({
+      maxFileBytes: 10 * MIB,
+      ceilingBytes: 10 * MIB,
+      source: "env",
+      envLocked: true,
+    });
+  });
+
+  it("uses a stored value under the ceiling and otherwise the default ceiling", () => {
+    expect(
+      effectiveUploadPolicy({
+        ceilingBytes: DEFAULT_UPLOAD_MAX_BYTES,
+        envExplicit: false,
+        persistedBytes: 2 * MIB,
+      }).source,
+    ).toBe("persisted");
+    expect(
+      effectiveUploadPolicy({
+        ceilingBytes: DEFAULT_UPLOAD_MAX_BYTES,
+        envExplicit: false,
+        persistedBytes: null,
+      }),
+    ).toMatchObject({ maxFileBytes: DEFAULT_UPLOAD_MAX_BYTES, source: "default" });
+    expect(
+      effectiveUploadPolicy({
+        ceilingBytes: DEFAULT_UPLOAD_MAX_BYTES,
+        envExplicit: false,
+        persistedBytes: DEFAULT_UPLOAD_MAX_BYTES + MIB,
+      }),
+    ).toMatchObject({ source: "invalid", maxFileBytes: 1 });
+  });
+});
+
+describe("proposeUploadPolicyChange", () => {
+  it("accepts a whole mebibyte at the byte ceiling and ignores organization role", () => {
+    expect(
+      proposeUploadPolicyChange({
+        envExplicit: false,
+        ceilingBytes: DEFAULT_UPLOAD_MAX_BYTES,
+        maxFileBytes: DEFAULT_UPLOAD_MAX_BYTES,
+      }),
+    ).toEqual({ maxFileBytes: DEFAULT_UPLOAD_MAX_BYTES });
+    expect(
+      proposeUploadPolicyChange({
+        envExplicit: false,
+        ceilingBytes: DEFAULT_UPLOAD_MAX_BYTES,
+        maxFileBytes: MIB,
+      }).maxFileBytes,
+    ).toBe(MIB);
+  });
+
+  it("rejects an env lock and a value above the ceiling", () => {
+    expect(() =>
+      proposeUploadPolicyChange({
+        envExplicit: true,
+        ceilingBytes: 10 * MIB,
+        maxFileBytes: MIB,
+      }),
+    ).toThrow(expect.objectContaining({ code: UPLOAD_POLICY_LOCKED_CODE }));
+    expect(() =>
+      proposeUploadPolicyChange({
+        envExplicit: false,
+        ceilingBytes: DEFAULT_UPLOAD_MAX_BYTES,
+        maxFileBytes: DEFAULT_UPLOAD_MAX_BYTES + 1,
+      }),
+    ).toThrow(AttachmentValidationError);
+    expect(() =>
+      proposeUploadPolicyChange({
+        envExplicit: false,
+        ceilingBytes: DEFAULT_UPLOAD_MAX_BYTES,
+        maxFileBytes: DEFAULT_UPLOAD_MAX_BYTES + 1,
+      }),
+    ).toThrow(expect.objectContaining({ code: UPLOAD_POLICY_INVALID_CODE }));
+  });
+
+  it("treats the stored value as bytes and refuses a mebibyte-sized reading of 26214400", () => {
+    const bytes = 26_214_400;
+    expect(bytes).toBe(25 * 1024 * 1024);
+    expect(
+      proposeUploadPolicyChange({
+        envExplicit: false,
+        ceilingBytes: bytes,
+        maxFileBytes: bytes,
+      }).maxFileBytes,
+    ).toBe(bytes);
+    for (const maxFileBytes of [0, -1, 1.5, 1024, bytes + 1, bytes * 1024 * 1024]) {
+      expect(() =>
+        proposeUploadPolicyChange({
+          envExplicit: false,
+          ceilingBytes: Number.MAX_SAFE_INTEGER,
+          maxFileBytes,
+        }),
+      ).toThrow(expect.objectContaining({ code: UPLOAD_POLICY_INVALID_CODE }));
+    }
+    expect(
+      effectiveUploadPolicy({
+        ceilingBytes: 10 * 1024 * 1024,
+        envExplicit: true,
+        persistedBytes: bytes,
+      }).maxFileBytes,
+    ).toBe(10 * 1024 * 1024);
+    expect(
+      effectiveUploadPolicy({
+        ceilingBytes: Number.MAX_SAFE_INTEGER,
+        envExplicit: false,
+        persistedBytes: bytes * 1024 * 1024,
+      }),
+    ).toMatchObject({ maxFileBytes: 1, source: "invalid" });
+  });
+});

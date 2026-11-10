@@ -1,18 +1,33 @@
+// Modified in the isolated phase-1 workspace slice (Apache-2.0; see LICENSE). Not an upstream Rakazo release.
 import type { AttachmentMimeType, MessageBlock } from "@rakazo/contracts";
 import {
   ATTACHMENT_COUNT_CEILING,
   ATTACHMENT_MAX_BYTES,
   ATTACHMENT_MAX_COUNT,
   attachmentSizeLabel,
+  DEFAULT_UPLOAD_MAX_BYTES,
   isAllowedAttachmentMimeType,
   isAttachmentImageMimeType,
+  UPLOAD_TOO_LARGE_CODE,
 } from "@rakazo/contracts";
 import { isApprovalAskBlock, isSecretAskBlock } from "./action-approval.js";
 
 export class AttachmentValidationError extends Error {
-  constructor(message: string) {
+  readonly code: string;
+  constructor(message: string, code = "attachment_invalid") {
     super(message);
     this.name = "AttachmentValidationError";
+    this.code = code;
+  }
+}
+
+/** Rejects a measured byte length. Callers must pass bytes they counted, not a declared header. */
+export function assertUploadByteLength(actual: number, maxBytes: number): void {
+  if (!Number.isSafeInteger(actual) || actual < 0 || actual > maxBytes) {
+    throw new AttachmentValidationError(
+      `Attachment exceeds the ${attachmentSizeLabel(maxBytes)} limit`,
+      UPLOAD_TOO_LARGE_CODE,
+    );
   }
 }
 
@@ -47,22 +62,25 @@ export function attachmentCountFromEnv(source: { MAX_ATTACHMENTS_PER_MESSAGE?: s
   return count;
 }
 
-export function uploadSizeFromEnv(source: { MAX_UPLOAD_SIZE_MB?: string }): number {
+/** Bytes from the environment, and whether the operator set the variable. */
+export function uploadLimitFromEnv(source: { MAX_UPLOAD_SIZE_MB?: string }): {
+  maxUploadSizeBytes: number;
+  explicit: boolean;
+} {
   const value = source.MAX_UPLOAD_SIZE_MB?.trim();
-  if (!value) return ATTACHMENT_MAX_BYTES;
+  if (!value) return { maxUploadSizeBytes: DEFAULT_UPLOAD_MAX_BYTES, explicit: false };
   const mb = Number(value);
-  // Leave room for base64 expansion and the JSON envelope in the HTTP body guard.
-  if (
-    !/^\d+$/.test(value) ||
-    !Number.isSafeInteger(mb) ||
-    mb <= 0 ||
-    mb > Math.floor(Number.MAX_SAFE_INTEGER / (2 * 1024 * 1024))
-  ) {
-    throw new Error(
-      "MAX_UPLOAD_SIZE_MB must be a positive integer number of MiB within the safe byte range",
-    );
+  // The variable is mebibytes, not bytes. This phase refuses anything above 25 MiB
+  // so a value of 26214400 cannot be read as 26214400 MiB.
+  const maxMib = DEFAULT_UPLOAD_MAX_BYTES / (1024 * 1024);
+  if (!/^\d+$/.test(value) || !Number.isSafeInteger(mb) || mb < 1 || mb > maxMib) {
+    throw new Error(`MAX_UPLOAD_SIZE_MB must be a whole number of MiB from 1 through ${maxMib}`);
   }
-  return mb * 1024 * 1024;
+  return { maxUploadSizeBytes: mb * 1024 * 1024, explicit: true };
+}
+
+export function uploadSizeFromEnv(source: { MAX_UPLOAD_SIZE_MB?: string }): number {
+  return uploadLimitFromEnv(source).maxUploadSizeBytes;
 }
 
 export function decodeAttachmentBase64(
@@ -74,6 +92,7 @@ export function decodeAttachmentBase64(
   if (normalized.length > Math.ceil(maxBytes / 3) * 4) {
     throw new AttachmentValidationError(
       `Attachment exceeds the ${attachmentSizeLabel(maxBytes)} limit`,
+      UPLOAD_TOO_LARGE_CODE,
     );
   }
   if (normalized.length % 4 !== 0 || !isWellFormedBase64(normalized)) {
@@ -87,9 +106,7 @@ export function decodeAttachmentBase64(
   }
   if (bytes.byteLength === 0) throw new AttachmentValidationError("Attachment content is empty");
   if (bytes.byteLength > maxBytes) {
-    throw new AttachmentValidationError(
-      `Attachment exceeds the ${attachmentSizeLabel(maxBytes)} limit`,
-    );
+    assertUploadByteLength(bytes.byteLength, maxBytes);
   }
   return new Uint8Array(bytes);
 }

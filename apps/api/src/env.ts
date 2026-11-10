@@ -1,3 +1,4 @@
+// Modified in the isolated phase-1 workspace slice (Apache-2.0; see LICENSE). Not an upstream Rakazo release.
 import type {
   ApnsVoipConfig,
   PhotonProjectCredentials,
@@ -27,7 +28,7 @@ import {
   resolveEncryptionKey,
   resolveScreenProxySecret,
   resolveSupervisorToken,
-  uploadSizeFromEnv,
+  uploadLimitFromEnv,
 } from "@rakazo/core";
 import { monitoringPseudonymSecret } from "@rakazo/logging";
 
@@ -81,6 +82,8 @@ export interface AppEnv {
   phoneCallRingSeconds: number;
   phoneCallCooldownMinutes: number;
   maxUploadSizeBytes: number;
+  /** True when MAX_UPLOAD_SIZE_MB is set. That value is the effective limit and the allocation ceiling. */
+  uploadSizeExplicit: boolean;
   maxAttachmentsPerMessage: number;
   /** Bot replies longer than this are read aloud as a summary; unset reads every reply in full. */
   voiceSummaryMinChars: number | undefined;
@@ -236,6 +239,7 @@ export function loadEnv(source: NodeJS.ProcessEnv = process.env): AppEnv {
   const sandboxProvider = resolveSandboxProvider(source);
   const cloudAgentProvider = resolveCloudAgentProvider(source);
   const deploymentModel = resolveDeploymentModel(source);
+  const uploadLimit = uploadLimitFromEnv(source);
   return {
     passwordAuth,
     breachedPasswordCheck: source.AUTH_BREACHED_PASSWORD_CHECK_ENABLED === "true",
@@ -270,7 +274,8 @@ export function loadEnv(source: NodeJS.ProcessEnv = process.env): AppEnv {
     navLinks: parseNavLinks(source.RAKAZO_NAV_LINKS),
     adminEmails: list(source.RAKAZO_ADMIN_EMAILS).map((email) => email.toLowerCase()),
     ...phoneCallSettings(source),
-    maxUploadSizeBytes: uploadSizeFromEnv(source),
+    maxUploadSizeBytes: uploadLimit.maxUploadSizeBytes,
+    uploadSizeExplicit: uploadLimit.explicit,
     maxAttachmentsPerMessage: attachmentCountFromEnv(source),
     voiceSummaryMinChars: voiceSummaryMinCharsFromEnv(source.VOICE_SUMMARY_MIN_CHARS),
     sandboxSupervisorUrl: source.SANDBOX_SUPERVISOR_URL ?? "http://127.0.0.1:7091",

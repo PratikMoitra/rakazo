@@ -2,8 +2,7 @@ import { PrismaPg } from "@prisma/adapter-pg";
 import type { KeyProvider } from "@rakazo/adapter-kit";
 import { resolveContentEncryption } from "@rakazo/core";
 import { getLogger } from "@rakazo/logging";
-import type { PoolClient } from "pg";
-import { Pool } from "pg";
+import type { Pool, PoolClient } from "pg";
 import { withContentEncryption } from "./content-encryption.js";
 import {
   ContentKeyRing,
@@ -12,8 +11,9 @@ import {
   masterKeysFromEnv,
   PgSpaceKeyStore,
 } from "./content-keys.js";
+import { fixtureConnectionPlan, openFixturePool } from "./fixture-transport.js";
 import { PrismaClient } from "./generated/prisma/client.js";
-import { installDbContext, rlsBypassKey, withRowLevelSecurity } from "./row-security.js";
+import { installDbContext, rlsBypassKeyForPassword, withRowLevelSecurity } from "./row-security.js";
 import { withTextSanitization } from "./text-sanitization.js";
 
 export type Db = PrismaClient;
@@ -34,8 +34,8 @@ const SLOW_CHECKOUT_MS = 1_000;
 const SATURATION_REPORT_INTERVAL_MS = 10_000;
 
 export function createPool(connectionString: string, options: DbClientOptions = {}): Pool {
-  const pool = new Pool({
-    connectionString,
+  const plan = fixtureConnectionPlan(connectionString);
+  const pool = openFixturePool(connectionString, {
     max: options.poolMax ?? DEFAULT_POOL_MAX,
     // Fail a checkout instead of queueing forever when Postgres is already at
     // max_connections (53300) or the pool is saturated.
@@ -43,7 +43,7 @@ export function createPool(connectionString: string, options: DbClientOptions = 
     // 0 disables idle eviction. Dropping idle clients and reopening them on the
     // next job burst is how a tight Postgres hits 53300; keep what we already have.
     idleTimeoutMillis: 0,
-    application_name: options.applicationName,
+    applicationName: options.applicationName,
     keepAlive: true,
   });
   // graphile-worker (and Node itself) require an 'error' listener on a shared
@@ -54,7 +54,7 @@ export function createPool(connectionString: string, options: DbClientOptions = 
     client.on("error", () => undefined);
   });
   installConnectRetry(pool);
-  installDbContext(pool);
+  installDbContext(pool, plan);
   installSaturationReport(pool, options.applicationName);
   return pool;
 }
@@ -70,6 +70,7 @@ export function createDb(
 ): { prisma: PrismaClient; pool: Pool; contentKeys: ContentKeyRing } {
   // Read first, so an invalid CONTENT_ENCRYPTION stops startup before any pool opens.
   const encryptWrites = options.encryptContent ?? resolveContentEncryption();
+  const plan = fixtureConnectionPlan(connectionString);
   // Without the configured key manager, new space keys would quietly be wrapped by
   // master keys held on this host.
   if (!options.keyProvider && (process.env.MASTER_KEY_PROVIDER?.trim() || "local") !== "local")
@@ -77,16 +78,15 @@ export function createDb(
       "MASTER_KEY_PROVIDER needs createDb(url, { keyProvider }) from @rakazo/adapters",
     );
   const pool = createPool(connectionString, options);
-  const keyPool = new Pool({
-    connectionString,
+  const keyPool = openFixturePool(connectionString, {
     max: 2,
     connectionTimeoutMillis: CHECKOUT_TIMEOUT_MS,
     idleTimeoutMillis: 30_000,
-    application_name: options.applicationName && `${options.applicationName}-keys`,
+    applicationName: options.applicationName && `${options.applicationName}-keys`,
     keepAlive: true,
   });
   keyPool.on("error", () => undefined);
-  installDbContext(keyPool);
+  installDbContext(keyPool, plan);
   installSaturationReport(keyPool, keyPool.options.application_name);
   const end = pool.end.bind(pool) as () => Promise<void>;
   pool.end = (async () => {
@@ -110,7 +110,7 @@ export function createDb(
   const prisma = withTextSanitization(
     withRowLevelSecurity(
       withContentEncryption(client, contentKeys),
-      rlsBypassKey(connectionString),
+      rlsBypassKeyForPassword(plan.password),
     ),
   );
   return { prisma, pool, contentKeys };
