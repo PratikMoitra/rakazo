@@ -107,9 +107,11 @@ export function createFixtureStopController(input: {
           throw new Error(`fixture server stop uncertain: status exit ${status.code}`);
         }
         progress.confirmed = true;
+        process.stdout.write("fixture-stop confirmed status=3\n");
       }
       await input.remove(input.root);
       progress.removed = true;
+      process.stdout.write("fixture-stop removed\n");
       revokeFixtureAllocation(input.handle);
     },
   };
@@ -143,7 +145,9 @@ export async function cleanupFixtureDataDirectory(input: {
         : `fixture server stop uncertain: ${detail}`,
     );
   }
+  process.stdout.write("fixture-stop confirmed status=3\n");
   await input.remove(input.root);
+  process.stdout.write("fixture-stop removed\n");
 }
 
 function mustRun(run: FixtureCommandRunner, command: string, args: string[]): Promise<void> {

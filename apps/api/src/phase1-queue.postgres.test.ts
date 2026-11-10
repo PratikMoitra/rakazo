@@ -18,6 +18,8 @@ import {
 import { expect, it } from "vitest";
 import { startFixtureCluster } from "./phase1-fixture-cluster.js";
 import { fixtureChildEnv } from "./phase1-fixture-env.js";
+import type { SupervisedWorker } from "./phase1-worker-supervision.js";
+import { stopClusterAfterWorkers, superviseFixtureWorker } from "./phase1-worker-supervision.js";
 
 it.skipIf(!existsSync("/usr/lib/postgresql/16/bin/initdb"))(
   "provisions credential cleanup on a fixture cluster and restarts the worker with operator assistance",
@@ -120,8 +122,10 @@ it.skipIf(!existsSync("/usr/lib/postgresql/16/bin/initdb"))(
       await refusal.stop();
       refusalStopped = true;
       success = await startFixtureCluster();
+      const cluster = success;
       releaseHandle();
-      publishFixtureHandle(success.handle);
+      publishFixtureHandle(cluster.handle);
+      const workers: SupervisedWorker[] = [];
       try {
         const fresh = success.url;
         const freshWorker = loginUrl(fresh, "rakazo_credential_worker", "phase1-worker-password");
@@ -574,7 +578,9 @@ it.skipIf(!existsSync("/usr/lib/postgresql/16/bin/initdb"))(
               [workerCurrent]: "current-secret",
             }),
           );
-          const crashingWorker = startWorkerMain(fresh, freshWorker, dummyFile, { crash: true });
+          const crashingWorker = startWorkerMain(fresh, freshWorker, dummyFile, workers, {
+            crash: true,
+          });
           const crash = await crashingWorker.until(/PHASE1_NEVER_MATCH/);
           expect(crash.code, crash.output).toBe(75);
           expect(JSON.parse(readFileSync(dummyFile, "utf8"))[workerRetired]).toBeUndefined();
@@ -592,7 +598,9 @@ it.skipIf(!existsSync("/usr/lib/postgresql/16/bin/initdb"))(
          WHERE id = $1::uuid`,
             [workerItem],
           );
-          const restarted = startWorkerMain(fresh, freshWorker, dummyFile, { crash: false });
+          const restarted = startWorkerMain(fresh, freshWorker, dummyFile, workers, {
+            crash: false,
+          });
           let ackedCount = 1;
           for (let attempt = 0; attempt < 40 && ackedCount !== 0; attempt += 1) {
             await new Promise((resolve) => setTimeout(resolve, 250));
@@ -602,13 +610,13 @@ it.skipIf(!existsSync("/usr/lib/postgresql/16/bin/initdb"))(
             );
             ackedCount = acked.rows[0]?.n ?? 1;
           }
-          restarted.stop();
+          await restarted.stop();
           expect(ackedCount, restarted.output()).toBe(0);
           const currentLeft = await admin.query<{ ciphertext: string }>(
             "SELECT ciphertext FROM messaging_installations WHERE id = 'phase1-worker'",
           );
           expect(currentLeft.rows[0]?.ciphertext).toBe(workerCurrent);
-          restarted.stop();
+          await restarted.stop();
           await admin.query(
             `SELECT graphile_worker.add_job(
            'messaging.credential-cleanup'::text,
@@ -616,7 +624,9 @@ it.skipIf(!existsSync("/usr/lib/postgresql/16/bin/initdb"))(
            NULL::text, NULL::timestamptz, 5, 'phase1-legacy-startup'::text,
            NULL::integer, NULL::text[], 'replace'::text)`,
           );
-          const refused = await runWorkerMain(fresh, freshWorker, dummyFile, { crash: false });
+          const refused = await runWorkerMain(fresh, freshWorker, dummyFile, workers, {
+            crash: false,
+          });
           expect(refused.code, refused.stderr).toBe(1);
           expect(refused.stderr).toContain("legacy jobs are queued");
           const legacyRemains = await admin.query<{ n: number }>(
@@ -630,7 +640,7 @@ it.skipIf(!existsSync("/usr/lib/postgresql/16/bin/initdb"))(
           await created.prisma.$disconnect();
         }
       } finally {
-        await success.stop();
+        await stopClusterAfterWorkers(workers, () => cluster.stop());
       }
     } finally {
       if (!refusalStopped) await refusal.stop();
@@ -687,9 +697,9 @@ function startWorkerMain(
   database: URL,
   workerUrl: URL,
   dummyFile: string,
+  workers: SupervisedWorker[],
   options: { crash: boolean },
 ) {
-  let output = "";
   const child = spawn(
     "/workspace/node_modules/.bin/tsx",
     [
@@ -712,45 +722,20 @@ function startWorkerMain(
       }),
     },
   );
-  child.stdout?.on("data", (chunk) => {
-    output += chunk.toString();
-  });
-  child.stderr?.on("data", (chunk) => {
-    output += chunk.toString();
-  });
-  const stop = () => {
-    child.kill("SIGTERM");
-  };
-  const until = (pattern: RegExp) =>
-    new Promise<{ code: number | null; output: string }>((resolve) => {
-      const timer = setTimeout(() => {
-        stop();
-        resolve({ code: null, output: redact(output) });
-      }, 40_000);
-      child.on("close", (code) => {
-        clearTimeout(timer);
-        resolve({ code, output: redact(output) });
-      });
-      const poll = setInterval(() => {
-        if (pattern.test(output)) {
-          clearInterval(poll);
-          clearTimeout(timer);
-          resolve({ code: null, output: redact(output) });
-        }
-      }, 200);
-      function redact(value: string) {
-        return value
-          .replaceAll(database.toString(), "[database]")
-          .replaceAll(workerUrl.toString(), "[worker]");
-      }
-    });
+  const supervised = superviseFixtureWorker(child);
+  workers.push(supervised);
+  const redact = (value: string) =>
+    value
+      .replaceAll(database.toString(), "[database]")
+      .replaceAll(workerUrl.toString(), "[worker]");
   return {
-    until,
-    stop,
-    output: () =>
-      output
-        .replaceAll(database.toString(), "[database]")
-        .replaceAll(workerUrl.toString(), "[worker]"),
+    until: (pattern: RegExp) =>
+      supervised.until(pattern).then((result) => ({
+        code: result.code,
+        output: redact(result.output),
+      })),
+    stop: () => supervised.stop(),
+    output: () => redact(supervised.output()),
   };
 }
 
@@ -758,9 +743,10 @@ function runWorkerMain(
   database: URL,
   workerUrl: URL,
   dummyFile: string,
+  workers: SupervisedWorker[],
   options: { crash: boolean },
 ) {
-  const started = startWorkerMain(database, workerUrl, dummyFile, options);
+  const started = startWorkerMain(database, workerUrl, dummyFile, workers, options);
   return started.until(/PHASE1_WAIT_FOR_PROCESS_CLOSE/).then((result) => ({
     code: result.code,
     stderr: result.output,

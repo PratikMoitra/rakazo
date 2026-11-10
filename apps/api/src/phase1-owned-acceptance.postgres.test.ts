@@ -43,16 +43,20 @@ it.skipIf(!enabled)(
         children.push(ranChild);
         const ran = await ranChild.result;
         const report = redact(ran.output);
-        if (
-          ran.code !== 0 ||
-          ran.error ||
-          !/\d+ passed/.test(report) ||
-          /\d+ skipped/.test(report)
-        ) {
+        const counts = report.match(
+          /Tests\s+(?:(\d+) failed \| )?(\d+) passed(?: \| (\d+) skipped)? \(/,
+        );
+        if (ran.code !== 0 || ran.error || !counts || counts[3] !== undefined) {
           throw new Error(`${name} failed\n${report}`);
         }
+        process.stdout.write(
+          `acceptance-suite ${name} passed=${counts[2]} failed=${counts[1] ?? 0} skipped=0\n`,
+        );
       } finally {
         await stopAll(children.map((child) => () => child.killAndWait()));
+        if (children.length > 0) {
+          process.stdout.write(`acceptance-child closed suite=${name}\n`);
+        }
         await cluster.stop();
       }
     }
